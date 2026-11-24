@@ -72,11 +72,15 @@ enable_testing()
 add_library(raftkv_common STATIC
   src/common/coding.cc
   src/common/crc32.cc
+  src/common/logger.cc
 )
 target_include_directories(raftkv_common PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
-target_link_libraries(raftkv_common PUBLIC raftkv_build_options)
+target_link_libraries(raftkv_common PUBLIC
+  raftkv_build_options
+  Threads::Threads
+)
 
 add_executable(smoke_test tests/smoke_test.cc)
 target_link_libraries(smoke_test PRIVATE
@@ -98,6 +102,18 @@ target_link_libraries(common_coding_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(common_logger_test tests/common_logger_test.cc)
+target_link_libraries(common_logger_test PRIVATE
+  raftkv_common
+  GTest::gtest_main
+)
+
+add_executable(common_mpsc_queue_test tests/common_mpsc_queue_test.cc)
+target_link_libraries(common_mpsc_queue_test PRIVATE
+  raftkv_common
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -108,9 +124,17 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET common_coding_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET common_logger_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
+  set_property(TARGET common_mpsc_queue_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
 gtest_discover_tests(smoke_test)
 gtest_discover_tests(common_test)
 gtest_discover_tests(common_coding_test)
+gtest_discover_tests(common_logger_test)
+gtest_discover_tests(common_mpsc_queue_test)

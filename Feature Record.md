@@ -68,7 +68,7 @@ sudo apt install -y \
   - `uint32_t Crc32(const char* data, size_t n)`（标准查表法实现）。
 - **测试验收**：随机生成整数与字符串，编码后解码与原值比对；篡改任意 1 字节验证 CRC32 必然变化。
 
-### [ ] F1.3 线程安全异步/同步日志器与 MPSC 任务队列
+### [x] F1.3 线程安全异步/同步日志器与 MPSC 任务队列
 
 - **目标**：调试分布式程序极度依赖带时间戳、线程 ID 和节点 ID 的日志；同时为后续 Raft Actor 准备好跨线程“收件箱队列”。
 - **文件位置**：`include/raftkv/common/logger.h`、`include/raftkv/common/mpsc_queue.h`
