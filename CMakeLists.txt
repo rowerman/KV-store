@@ -84,6 +84,7 @@ target_link_libraries(raftkv_common PUBLIC
 
 add_library(raftkv_net STATIC
   src/net/buffer.cc
+  src/net/poller.cc
 )
 target_link_libraries(raftkv_net PUBLIC raftkv_common)
 
@@ -125,6 +126,12 @@ target_link_libraries(buffer_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(poller_test tests/poller_test.cc)
+target_link_libraries(poller_test PRIVATE
+  raftkv_net
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -144,6 +151,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET buffer_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET poller_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -153,3 +163,4 @@ gtest_discover_tests(common_coding_test)
 gtest_discover_tests(common_logger_test)
 gtest_discover_tests(common_mpsc_queue_test)
 gtest_discover_tests(buffer_test)
+gtest_discover_tests(poller_test)

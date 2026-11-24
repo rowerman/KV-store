@@ -94,7 +94,7 @@ sudo apt install -y \
   - `ReadFd(int fd, int* saved_errno)`（使用 `readv` + 64KB 栈上临时缓冲区一次读尽内核缓冲）。
 - **测试验收**：编写 `buffer_test.cc`，测试连续追加触发扩容、读走前半段后复用头部空间（内部腾挪）。
 
-### [ ] F2.2 `Channel` 与 `EpollPoller`（epoll ET 模式封装）
+### [x] F2.2 `Channel` 与 `EpollPoller`（epoll ET 模式封装）
 
 - **目标**：封装 Linux `epoll_create1`、`epoll_ctl`、`epoll_wait`，把底层文件描述符事件转化为 C++ 回调。
 - **文件位置**：`include/raftkv/net/channel.h`、`include/raftkv/net/poller.h`、`src/net/poller.cc`
