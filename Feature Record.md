@@ -44,7 +44,7 @@ sudo apt install -y \
 
 > **阶段目标**：先把所有模块都会用到的“工具箱”写好，这些类完全独立，不涉及网络和多线程复杂逻辑，最适合热身。
 
-### [ ] F1.1 错误状态封装 `Status` 与零拷贝视图 `Slice`
+### [x] F1.1 错误状态封装 `Status` 与零拷贝视图 `Slice`
 
 - **目标**：统一全项目的函数返回值（避免到处返回 `-1` / `false` 不知道错在哪），并用轻量视图减少字符串拷贝。
 - **文件位置**：`include/raftkv/common/status.h`、`include/raftkv/common/slice.h`
@@ -57,7 +57,7 @@ sudo apt install -y \
   - `Slice::compare(const Slice& b)`、`starts_with()`、`ToString()`。
 - **测试验收**：编写 `tests/unit/common_test.cc`，验证不同错误码构造、拷贝与字典序比较。
 
-### [ ] F1.2 二进制编解码工具 `Coding` 与 `CRC32` 校验
+### [x] F1.2 二进制编解码工具 `Coding` 与 `CRC32` 校验
 
 - **目标**：解决大小端字节序问题（网络帧头用大端，磁盘文件用小端），并提供防数据损坏的 CRC32 校验。
 - **文件位置**：`include/raftkv/common/coding.h`、`src/common/coding.cc`、`include/raftkv/common/crc32.h`、`src/common/crc32.cc`
