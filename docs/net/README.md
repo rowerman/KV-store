@@ -34,3 +34,16 @@
 - `RunEvery` 的周期必须大于 0；周期触发不会补发线程阻塞期间积压的多个周期。
 - 已经进入当前到期批次的回调无法被其他线程撤回，取消只保证后续周期不再执行。
 
+## TCP 服务端约定
+
+- `TcpConnection` 的读、写、关闭和错误回调只在所属 IO EventLoop 线程执行。
+- `MessageCallback` 接收的 `Buffer*` 仅在当前回调期间有效，回调应读取并消费数据。
+- `Send` 和 `Shutdown` 可从任意线程调用；跨线程数据会复制后投递到连接线程。
+- 输出缓冲超过高水位时应暂停继续生产数据；写完成回调表示输出缓冲已经排空。
+- 连接关闭只通知一次，关闭后 Channel 先注销，随后才关闭 fd。
+- `TcpServer` 的回调配置必须在 `Start` 前完成。
+- 连接表由互斥锁保护，连接在所属 IO 线程关闭并从表中移除，保证 Channel 和
+  Poller 的线程归属一致。
+- `TcpServer::Stop` 必须由基 EventLoop 线程调用，并确保停止前不再接受新连接。
+- `io_threads=0` 时连接直接由基 EventLoop 处理，否则通过 Round-Robin 分配。
+

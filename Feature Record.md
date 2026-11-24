@@ -120,7 +120,7 @@ sudo apt install -y \
   - `RunAfter(uint64_t delay_ms, Functor cb)`、`RunEvery(uint64_t interval_ms, Functor cb)`、`CancelTimer(TimerId id)`。
 - **测试验收**：在子线程运行 `EventLoop`，主线程调用 `QueueInLoop` 和 `RunAfter(100ms)`，验证回调在子线程按时触发。
 
-### [ ] F2.4 `Acceptor`、`TcpConnection` 与主从 Reactor `TcpServer`
+### [x] F2.4 `Acceptor`、`TcpConnection` 与主从 Reactor `TcpServer`
 
 - **目标**：完成多线程高并发 TCP 服务端，1 个主线程接收连接，N 个子线程处理收发。
 - **文件位置**：`include/raftkv/net/tcp_connection.h`、`include/raftkv/net/tcp_server.h` 及对应 `.cc`

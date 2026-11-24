@@ -54,6 +54,8 @@ class EventLoop {
   bool CancelTimer(TimerId id);
 
  private:
+  friend class Acceptor;
+  friend class TcpConnection;
   // 写 eventfd，唤醒阻塞中的 epoll_wait。
   void Wakeup();
   // 清空 eventfd 计数。
