@@ -107,7 +107,7 @@ sudo apt install -y \
   - `EpollPoller::UpdateChannel(Channel*)`、`RemoveChannel(Channel*)`（统一开启 `EPOLLET`）。
 - **测试验收**：使用 Linux `pipe()` 创建管道，把读端注册到 `EpollPoller`，向写端写入数据，验证 `Poll()` 能精准唤醒并触发 `read_cb_`。
 
-### [ ] F2.3 `EventLoop` 与定时器队列（`timerfd` + `eventfd`）
+### [x] F2.3 `EventLoop` 与定时器队列（`timerfd` + `eventfd`）
 
 - **目标**：实现“One Loop Per Thread”核心引擎，支持跨线程安全投递任务和毫秒级定时回调（后续 Raft 选举超时与 RPC 超时全靠它）。
 - **文件位置**：`include/raftkv/net/event_loop.h`、`src/net/event_loop.cc`、`include/raftkv/net/timer_queue.h`
