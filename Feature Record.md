@@ -83,7 +83,7 @@ sudo apt install -y \
 
 > **阶段目标**：手写一个能稳定扛住高并发、支持粘包拆包和异步回调的 C++ RPC 框架。
 
-### [ ] F2.1 动态字节缓冲区 `Buffer`
+### [x] F2.1 动态字节缓冲区 `Buffer`
 
 - **目标**：作为每个 TCP 连接的收发缓存，避免频繁 `malloc` 和内存搬移。
 - **文件位置**：`include/raftkv/net/buffer.h`、`src/net/buffer.cc`

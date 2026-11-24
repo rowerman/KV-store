@@ -82,6 +82,11 @@ target_link_libraries(raftkv_common PUBLIC
   Threads::Threads
 )
 
+add_library(raftkv_net STATIC
+  src/net/buffer.cc
+)
+target_link_libraries(raftkv_net PUBLIC raftkv_common)
+
 add_executable(smoke_test tests/smoke_test.cc)
 target_link_libraries(smoke_test PRIVATE
   raftkv_build_options
@@ -114,6 +119,12 @@ target_link_libraries(common_mpsc_queue_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(buffer_test tests/buffer_test.cc)
+target_link_libraries(buffer_test PRIVATE
+  raftkv_net
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -130,6 +141,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET common_mpsc_queue_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET buffer_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -138,3 +152,4 @@ gtest_discover_tests(common_test)
 gtest_discover_tests(common_coding_test)
 gtest_discover_tests(common_logger_test)
 gtest_discover_tests(common_mpsc_queue_test)
+gtest_discover_tests(buffer_test)
