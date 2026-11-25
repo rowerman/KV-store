@@ -93,6 +93,33 @@ add_library(raftkv_net STATIC
 )
 target_link_libraries(raftkv_net PUBLIC raftkv_common)
 
+# 在构建目录生成 KV 与 Raft 的 Protobuf C++ 源码。
+protobuf_generate_cpp(RAFTKV_PROTO_SRCS RAFTKV_PROTO_HEADERS
+  proto/rpc_kv.proto
+  proto/rpc_raft.proto
+)
+
+add_library(raftkv_proto STATIC ${RAFTKV_PROTO_SRCS})
+target_include_directories(raftkv_proto PUBLIC
+  ${CMAKE_CURRENT_BINARY_DIR}
+)
+# Protobuf 36 会在 ASan 下切换 ClassData ABI，必须与预编译库保持一致。
+target_compile_definitions(raftkv_proto PUBLIC
+  PROTOBUF_MESSAGE_GLOBALS_TEMPORARY_OPTOUT
+)
+target_link_libraries(raftkv_proto PUBLIC
+  raftkv_build_options
+  protobuf::libprotobuf
+)
+
+add_library(raftkv_rpc STATIC
+  src/rpc/frame_codec.cc
+)
+target_link_libraries(raftkv_rpc PUBLIC
+  raftkv_net
+  raftkv_proto
+)
+
 add_executable(smoke_test tests/smoke_test.cc)
 target_link_libraries(smoke_test PRIVATE
   raftkv_build_options
@@ -161,6 +188,12 @@ target_link_libraries(tcp_client_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(frame_codec_test tests/frame_codec_test.cc)
+target_link_libraries(frame_codec_test PRIVATE
+  raftkv_rpc
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -195,6 +228,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET tcp_client_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET frame_codec_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -209,3 +245,4 @@ gtest_discover_tests(event_loop_test)
 gtest_discover_tests(tcp_connection_test)
 gtest_discover_tests(tcp_server_test)
 gtest_discover_tests(tcp_client_test)
+gtest_discover_tests(frame_codec_test)

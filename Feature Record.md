@@ -140,7 +140,7 @@ sudo apt install -y \
 - **必写函数**：`Connect()`、`Disconnect()`、`Send(Slice data)`、非阻塞 `connect` 可写事件检查（`getsockopt(SO_ERROR)`）、失败后通过 `EventLoop::RunAfter` 指数退避重试。
 - **测试验收**：先启动 `TcpClient`（此时服务端未开），2 秒后再启动 Echo Server，验证客户端自动重连成功并正常收发消息。
 
-### [ ] F2.6 自定义 20 字节帧协议编解码器与 `.proto` 定义
+### [x] F2.6 自定义 20 字节帧协议编解码器与 `.proto` 定义
 
 - **目标**：彻底解决 TCP 粘包/拆包问题，把字节流切分成一条条完整的 Protobuf RPC 消息。
 - **文件位置**：`proto/rpc_kv.proto`、`proto/rpc_raft.proto`、`include/raftkv/rpc/frame_codec.h`、`src/rpc/frame_codec.cc`

@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package raftkv.proto;
+
+// 客户端 RPC 的通用状态码。
+enum StatusCode {
+  STATUS_CODE_OK = 0;
+  STATUS_CODE_NOT_FOUND = 1;
+  STATUS_CODE_NOT_LEADER = 2;
+  STATUS_CODE_TIMEOUT = 3;
+  STATUS_CODE_INTERNAL = 4;
+  STATUS_CODE_INVALID_ARGUMENT = 5;
+}
+
+// 帧级协议错误，不承载具体业务结果。
+message RpcErrorResponse {
+  StatusCode status = 1;
+  string message = 2;
+}
+
+// Put 请求；client_id 与 seq_num 用于写请求幂等去重。
+message KvPutRequest {
+  uint64 client_id = 1;
+  uint64 seq_num = 2;
+  bytes key = 3;
+  bytes value = 4;
+}
+
+// Delete 请求；与 Put 共用客户端幂等字段。
+message KvDeleteRequest {
+  uint64 client_id = 1;
+  uint64 seq_num = 2;
+  bytes key = 3;
+}
+
+// Get 请求；可选择线性一致读或允许本地读。
+message KvGetRequest {
+  bytes key = 1;
+  // true 表示通过 ReadIndex 完成线性一致读。
+  bool linearizable = 2;
+}
+
+// 有序范围扫描请求；end_key 为空表示扫描到末尾。
+message KvScanRequest {
+  bytes start_key = 1;
+  bytes end_key = 2;
+  uint32 limit = 3;
+}
+
+// Put 响应。
+message KvPutResponse {
+  StatusCode status = 1;
+  string message = 2;
+  // 非 Leader 时返回当前 Leader 的地址提示。
+  string leader_hint = 3;
+}
+
+// Delete 响应。
+message KvDeleteResponse {
+  StatusCode status = 1;
+  string message = 2;
+  string leader_hint = 3;
+}
+
+// Get 响应；仅在成功时设置 value。
+message KvGetResponse {
+  StatusCode status = 1;
+  bytes value = 2;
+  string message = 3;
+  string leader_hint = 4;
+}
+
+// 扫描结果中的单个键值对。
+message KvEntry {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+// 范围扫描响应。
+message KvScanResponse {
+  StatusCode status = 1;
+  repeated KvEntry entries = 2;
+  bool has_more = 3;
+  string message = 4;
+  string leader_hint = 5;
+}

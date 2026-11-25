@@ -1,0 +1,73 @@
+syntax = "proto3";
+
+package raftkv.proto;
+
+enum EntryType {
+  ENTRY_TYPE_NORMAL = 0;
+  ENTRY_TYPE_CONF_CHANGE = 1;
+  ENTRY_TYPE_NO_OP = 2;
+}
+
+// Raft 日志条目；payload 由 entry_type 决定解释方式。
+message LogEntry {
+  uint64 term = 1;
+  uint64 index = 2;
+  EntryType entry_type = 3;
+  bytes payload = 4;
+}
+
+// 正式投票和 Pre-Vote 共用该请求。
+message RequestVoteRequest {
+  uint64 term = 1;
+  uint32 candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+  // true 表示本请求只探测是否可能获得多数派支持。
+  bool is_pre_vote = 5;
+}
+
+message RequestVoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+// 日志复制和 ReadIndex 心跳共用该请求。
+message AppendEntriesRequest {
+  uint64 term = 1;
+  uint32 leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated LogEntry entries = 5;
+  uint64 leader_commit = 6;
+  uint64 read_ctx_id = 7;
+}
+
+// 日志复制结果；失败时携带快速回退信息。
+message AppendEntriesResponse {
+  uint64 term = 1;
+  bool success = 2;
+  // 冲突任期及该任期的首条日志索引，用于快速回退。
+  uint64 conflict_term = 3;
+  uint64 conflict_index = 4;
+  // 非 0 表示该响应确认了一次 ReadIndex 心跳。
+  uint64 read_ctx_id = 5;
+}
+
+// 将快照按 offset 分块发送。
+message InstallSnapshotRequest {
+  uint64 term = 1;
+  uint32 leader_id = 2;
+  uint64 last_included_index = 3;
+  uint64 last_included_term = 4;
+  uint64 offset = 5;
+  bytes data = 6;
+  // 最后一块必须置为 true。
+  bool done = 7;
+}
+
+// 快照分块接收结果。
+message InstallSnapshotResponse {
+  uint64 term = 1;
+  bool success = 2;
+  uint64 received_offset = 3;
+}
