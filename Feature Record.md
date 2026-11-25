@@ -182,7 +182,7 @@ sudo apt install -y \
   - `MemTable::NewIterator()`（返回有序迭代器，支持 `Seek(target)`、`Next()`、`Valid()`）。
 - **测试验收**：插入 10 万条乱序 KV、覆盖更新、删除部分 Key，验证点查与全量有序遍历结果与 `std::map` 100% 一致。
 
-### [ ] F3.2 预写日志 `WAL`（写入与崩溃回放）
+### [x] F3.2 预写日志 `WAL`（写入与崩溃回放）
 
 - **目标**：保证写入 `MemTable` 前先顺序落盘，进程 `kill -9` 后数据不丢。
 - **文件位置**：`include/raftkv/storage/wal.h`、`src/storage/wal.cc`

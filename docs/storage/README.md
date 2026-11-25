@@ -41,6 +41,21 @@
 - `ApproximateMemoryUsage` 包含节点固定开销和字符串容量，用于后续 Flush 阈值，
   不要求与 allocator 实际占用逐字节一致。
 
+## WAL
+
+- WAL 记录由小端 `CRC32 + sequence + type + key_size + key + value_size + value`
+  组成，CRC 覆盖除自身外的完整记录。
+- `WalWriter::Append` 只写内核页缓存；只有 `Sync` 成功才保证崩溃持久性。
+- `WalWriter` 使用 `O_CLOEXEC`，支持截断新建和 `O_APPEND` 追加两种打开方式。
+- Delete 的 WAL Value 固定为空，与 MemTable 墓碑表示一致。
+- 单条记录上限为 64 MiB，Writer 和 Reader 都在分配或写入前校验长度。
+- `WalReader::Replay` 在正常 EOF 或末尾半条记录处返回 `OK`；CRC、非法类型、保留
+  序列号和超限长度返回 `Corruption`。
+- `Replay` 可选返回 CRC 完整前缀长度，便于上层修复时截断损坏尾部；回放本身只读。
+- 回调中的 Key/Value Slice 只在当前回调期间有效。
+- 当前不负责 WAL 轮转、删除、Group Commit 或 MemTable 恢复装配；上层必须在
+  `Sync` 成功后再将写入应用到 MemTable。
+
 ## 构建与依赖
 
 - `raftkv_storage` 当前只依赖 `raftkv_common`，不依赖网络、RPC 或 Protobuf。
