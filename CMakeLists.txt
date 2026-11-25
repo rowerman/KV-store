@@ -86,6 +86,7 @@ add_library(raftkv_net STATIC
   src/net/buffer.cc
   src/net/event_loop.cc
   src/net/poller.cc
+  src/net/tcp_client.cc
   src/net/tcp_connection.cc
   src/net/tcp_server.cc
   src/net/timer_queue.cc
@@ -154,6 +155,12 @@ target_link_libraries(tcp_server_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(tcp_client_test tests/tcp_client_test.cc)
+target_link_libraries(tcp_client_test PRIVATE
+  raftkv_net
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -185,6 +192,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET tcp_server_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET tcp_client_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -198,3 +208,4 @@ gtest_discover_tests(poller_test)
 gtest_discover_tests(event_loop_test)
 gtest_discover_tests(tcp_connection_test)
 gtest_discover_tests(tcp_server_test)
+gtest_discover_tests(tcp_client_test)

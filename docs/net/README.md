@@ -47,3 +47,15 @@
 - `TcpServer::Stop` 必须由基 EventLoop 线程调用，并确保停止前不再接受新连接。
 - `io_threads=0` 时连接直接由基 EventLoop 处理，否则通过 Round-Robin 分配。
 
+## TCP 客户端约定
+
+- `TcpClient` 不拥有传入的 `EventLoop`，连接、消息和写完成回调都在该 EventLoop
+  线程执行。
+- `Connect()` 可重复调用；`Disconnect()` 会取消待执行重连，并允许之后再次
+  `Connect()`。
+- 默认重连等待从 50 ms 开始翻倍，最多 500 ms；连接成功后重试间隔重置。
+- `Send()` 可在任意线程调用，但未连接时直接丢弃，不在客户端内部排队。上层 RPC
+  应通过请求超时处理连接不可用。
+- 当前只接受数字 IPv4 地址。客户端必须在所属 `EventLoop` 析构前完成关闭，
+  并确保 EventLoop 处理完关闭任务。
+

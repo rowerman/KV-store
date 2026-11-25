@@ -133,7 +133,7 @@ sudo apt install -y \
   - `TcpServer::Start()`、`SetMessageCallback(...)`、`SetConnectionCallback(...)`。
 - **测试验收**：编写 Echo Server 示例程序，用 `nc` 或多线程压测脚本同时建立 100 个连接收发随机长度数据，验证回显 100% 正确且断开无内存泄漏（开启 ASan）。
 
-### [ ] F2.5 `TcpClient` 与自动重连
+### [x] F2.5 `TcpClient` 与自动重连
 
 - **目标**：提供非阻塞异步 TCP 客户端，支持断线指数退避重连，供节点间 Raft 通信与外部 Client SDK 使用。
 - **文件位置**：`include/raftkv/net/tcp_client.h`、`src/net/tcp_client.cc`

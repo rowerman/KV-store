@@ -15,6 +15,10 @@
 
 namespace raftkv {
 
+namespace detail {
+class TcpClientImpl;
+}
+
 // 绑定单线程的 epoll 事件循环。
 // 网络事件、跨线程任务和定时器回调都在创建该对象的线程执行。
 class EventLoop {
@@ -56,6 +60,7 @@ class EventLoop {
  private:
   friend class Acceptor;
   friend class TcpConnection;
+  friend class detail::TcpClientImpl;
   // 写 eventfd，唤醒阻塞中的 epoll_wait。
   void Wakeup();
   // 清空 eventfd 计数。
