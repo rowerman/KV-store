@@ -82,6 +82,12 @@ target_link_libraries(raftkv_common PUBLIC
   Threads::Threads
 )
 
+add_library(raftkv_storage STATIC
+  src/storage/memtable.cc
+  src/storage/skiplist.cc
+)
+target_link_libraries(raftkv_storage PUBLIC raftkv_common)
+
 add_library(raftkv_net STATIC
   src/net/buffer.cc
   src/net/event_loop.cc
@@ -202,6 +208,12 @@ target_link_libraries(rpc_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(memtable_test tests/memtable_test.cc)
+target_link_libraries(memtable_test PRIVATE
+  raftkv_storage
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -242,6 +254,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET rpc_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET memtable_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -258,3 +273,4 @@ gtest_discover_tests(tcp_server_test)
 gtest_discover_tests(tcp_client_test)
 gtest_discover_tests(frame_codec_test)
 gtest_discover_tests(rpc_test)
+gtest_discover_tests(memtable_test)

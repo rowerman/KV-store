@@ -169,7 +169,7 @@ sudo apt install -y \
 
 > **阶段目标**：不依赖任何网络代码，独立写出一个支持 `Put / Get / Delete / Scan`、崩溃恢复和快照的嵌入式 KV 存储引擎。
 
-### [ ] F3.1 内存跳表 `SkipList` 与 `MemTable`
+### [x] F3.1 内存跳表 `SkipList` 与 `MemTable`
 
 - **目标**：实现高性能内存有序数据结构，作为 LSM-Tree 接收写入的第一站。
 - **文件位置**：`include/raftkv/storage/skiplist.h`、`include/raftkv/storage/memtable.h`

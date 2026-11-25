@@ -8,3 +8,42 @@
 - 修改注意：写入顺序必须保持 WAL 先于可见内存状态；文件切换和 MANIFEST 更新要
   保证崩溃后可恢复；读路径不得持有阻塞后台线程的锁。
 
+## InternalKey 与排序
+
+- `InternalKey` 由 `user_key`、严格递增的 `sequence` 和 `ValueType` 组成。
+- 排序先按用户键字节升序，再按序列号降序，使同一用户键的新版本排在旧版本前。
+- 序列号相同时按 `ValueType` 数值降序，保证比较结果稳定。
+- `kMaxSequenceNumber` 是点查哨兵，正常 MemTable 写入不能使用该序列号。
+- `ValueType::kDeletion = 0`、`ValueType::kValue = 1`，后续 WAL 和 SSTable 必须
+  保持相同磁盘编码。
+
+## SkipList
+
+- 最大高度固定为 12，提升概率为 1/4，随机种子由构造函数指定。
+- 采用单写多读模型：只允许一个写线程调用 `Add`，任意多个读者可以使用迭代器和
+  `Get`。
+- 节点构造完成后通过 release store 发布 next 指针，读者使用 acquire load 获取。
+- 节点在 SkipList 生命周期内只新增不删除；析构时必须确保没有并发读者。
+- `Seek(Slice)` 使用最大序列号定位最新用户版本；`Seek(InternalKey)` 用于后续
+  多路归并按完整内部键定位。
+- `Next()` 只沿第 0 层前进，因此一次迭代按内部键全序返回全部版本。
+
+## MemTable
+
+- `Add` 接收严格递增序列号；非法枚举、最大序列号和重复/倒退序列号返回
+  `InvalidArgument`。
+- Put 保存 Value；Delete 以空 Value 墓碑写入，不能直接丢弃，否则无法屏蔽旧层。
+- `Get` 返回指定用户键的最新版本。普通值返回
+  `OK + is_deleted=false`，墓碑返回 `OK + 空值 + is_deleted=true`。
+- `Get` 未找到返回 `NotFound`，且不修改输出参数。
+- `NewIterator` 返回全部内部版本，不在 MemTable 层去重；Flush 写出全部版本，
+  用户可见的去重由 MergingIterator 负责。
+- `ApproximateMemoryUsage` 包含节点固定开销和字符串容量，用于后续 Flush 阈值，
+  不要求与 allocator 实际占用逐字节一致。
+
+## 构建与依赖
+
+- `raftkv_storage` 当前只依赖 `raftkv_common`，不依赖网络、RPC 或 Protobuf。
+- 修改跳表并发模型时，必须同步检查节点发布顺序、迭代器生命周期和销毁约束。
+- 修改内部键比较规则时，必须同步更新 MemTable、后续 SSTable 比较器和磁盘格式。
+
