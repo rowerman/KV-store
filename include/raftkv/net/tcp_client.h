@@ -57,6 +57,8 @@ class TcpClient {
 
   // 主动断开并停止自动重连；可重复调用。
   void Disconnect();
+  // 关闭当前连接或正在建立的 socket，保留自动重连意图。
+  void CloseConnection();
 
   // 发送数据；未连接时直接丢弃。
   void Send(Slice data);

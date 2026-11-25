@@ -151,7 +151,7 @@ sudo apt install -y \
   - `FrameCodec::TryDecode(Buffer* in, RpcFrame* out)`（返回 `kOk` / `kIncomplete` 半包继续等 / `kCorrupt` 魔数或 CRC 错）。
 - **测试验收**：把 3 个帧拼在一起、再故意按“每次只喂 1 个字节”或“随机长度切分”送入 `TryDecode`，验证能准确解出全部 3 个完整帧。
 
-### [ ] F2.7 异步 `RpcServer` 与 `RpcClient`
+### [x] F2.7 异步 `RpcServer` 与 `RpcClient`
 
 - **目标**：在 `TcpServer` / `TcpClient` 之上封装方法路由、全双工 `request_id` 异步匹配和请求超时控制。
 - **文件位置**：`include/raftkv/rpc/rpc_server.h`、`include/raftkv/rpc/rpc_client.h` 及对应 `.cc`

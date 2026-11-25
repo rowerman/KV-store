@@ -92,6 +92,12 @@ class TcpClientImpl : public std::enable_shared_from_this<TcpClientImpl> {
     loop_->RunInLoop([self] { self->DisconnectInLoop(true); });
   }
 
+  void CloseConnection() {
+    auto self = shared_from_this();
+    loop_->RunInLoop(
+        [self] { self->CloseConnectionInLoop(); });
+  }
+
   void Destroy() {
     auto self = shared_from_this();
     loop_->RunInLoop([self] { self->DisconnectInLoop(false); });
@@ -356,6 +362,20 @@ class TcpClientImpl : public std::enable_shared_from_this<TcpClientImpl> {
     }
   }
 
+  void CloseConnectionInLoop() {
+    if (state_ == State::kConnecting) {
+      CloseConnectingSocketInLoop();
+      ScheduleReconnectInLoop();
+      return;
+    }
+    TcpConnectionPtr connection = connection_;
+    if (state_ == State::kConnected && connection != nullptr) {
+      // 正常关闭回调会统一更新状态并安排下一次重连。
+      connection->ForceClose();
+    }
+  }
+
+
   void CloseConnectingSocketInLoop() {
     std::shared_ptr<Channel> channel =
         std::move(connecting_channel_);
@@ -494,6 +514,10 @@ void TcpClient::Connect() {
 
 void TcpClient::Disconnect() {
   impl_->Disconnect();
+}
+
+void TcpClient::CloseConnection() {
+  impl_->CloseConnection();
 }
 
 void TcpClient::Send(Slice data) {

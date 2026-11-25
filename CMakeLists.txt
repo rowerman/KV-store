@@ -114,6 +114,8 @@ target_link_libraries(raftkv_proto PUBLIC
 
 add_library(raftkv_rpc STATIC
   src/rpc/frame_codec.cc
+  src/rpc/rpc_client.cc
+  src/rpc/rpc_server.cc
 )
 target_link_libraries(raftkv_rpc PUBLIC
   raftkv_net
@@ -194,6 +196,12 @@ target_link_libraries(frame_codec_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(rpc_test tests/rpc_test.cc)
+target_link_libraries(rpc_test PRIVATE
+  raftkv_rpc
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -231,6 +239,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET frame_codec_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET rpc_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -246,3 +257,4 @@ gtest_discover_tests(tcp_connection_test)
 gtest_discover_tests(tcp_server_test)
 gtest_discover_tests(tcp_client_test)
 gtest_discover_tests(frame_codec_test)
+gtest_discover_tests(rpc_test)
