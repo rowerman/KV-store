@@ -192,7 +192,7 @@ sudo apt install -y \
   - `WalReader::Replay(std::function<void(uint64_t, ValueType, Slice, Slice)> cb)`（遇到文件末尾半条损坏记录时安全截断停止）。
 - **测试验收**：写入 1,000 条记录，故意截断文件最后 5 字节模拟断电，验证 `Replay` 能无损恢复前 999 条且不崩溃。
 
-### [ ] F3.3 布隆过滤器 `BloomFilter` 与 `LRUCache`
+### [x] F3.3 布隆过滤器 `BloomFilter` 与 `LRUCache`
 
 - **目标**：为磁盘 SSTable 提供查询加速，过滤不存在的 Key 并缓存热点 Data Block。
 - **文件位置**：`include/raftkv/storage/bloom_filter.h`、`include/raftkv/storage/lru_cache.h`

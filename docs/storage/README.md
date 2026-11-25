@@ -56,6 +56,25 @@
 - 当前不负责 WAL 轮转、删除、Group Commit 或 MemTable 恢复装配；上层必须在
   `Sync` 成功后再将写入应用到 MemTable。
 
+## BloomFilter
+
+- SSTable Filter Block 使用每 Key 10 bit、7 个哈希位置的 Bloom Filter。
+- 持久化格式为 `magic + bit_count + bitmap`，整数使用小端编码。
+- 哈希使用自实现 FNV-1a 双哈希，避免依赖 `std::hash` 的平台差异。
+- `Build` 在临时字符串中完成构建，失败不修改输出。
+- `KeyMayMatch` 返回 false 表示 Key 一定不存在；返回 true 表示可能存在。
+- magic、长度或 bitmap 损坏时查询返回 true，宁可多读一次 Block，也不能漏掉真实 Key。
+
+## LRUCache
+
+- Block Cache 按近似字节容量淘汰，成本包含固定开销、Key 和 Value 大小。
+- Value 使用 `shared_ptr<const std::string>`，淘汰只释放缓存持有的引用，正在读取的
+  Block 仍然有效。
+- 链表头为最近使用项，链表尾为最久未使用项；`Lookup` 命中会把节点移动到头部。
+- 所有链表、哈希表、使用量和访问顺序都由同一个 mutex 保护。
+- 单项超过总容量或 Value 为空时返回 `InvalidArgument`，已有缓存状态保持不变。
+- 修改缓存键编码或成本公式时，应同步检查后续 SSTable Block Cache 的容量预算。
+
 ## 构建与依赖
 
 - `raftkv_storage` 当前只依赖 `raftkv_common`，不依赖网络、RPC 或 Protobuf。

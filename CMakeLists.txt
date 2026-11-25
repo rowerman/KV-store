@@ -83,6 +83,8 @@ target_link_libraries(raftkv_common PUBLIC
 )
 
 add_library(raftkv_storage STATIC
+  src/storage/bloom_filter.cc
+  src/storage/lru_cache.cc
   src/storage/memtable.cc
   src/storage/skiplist.cc
   src/storage/wal.cc
@@ -221,6 +223,12 @@ target_link_libraries(wal_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(bloom_lru_test tests/bloom_lru_test.cc)
+target_link_libraries(bloom_lru_test PRIVATE
+  raftkv_storage
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -267,6 +275,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET wal_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET bloom_lru_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -285,3 +296,4 @@ gtest_discover_tests(frame_codec_test)
 gtest_discover_tests(rpc_test)
 gtest_discover_tests(memtable_test)
 gtest_discover_tests(wal_test)
+gtest_discover_tests(bloom_lru_test)
