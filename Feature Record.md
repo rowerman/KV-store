@@ -204,7 +204,7 @@ sudo apt install -y \
   - `LRUCache::Insert(key, value)`、`Lookup(key)`、`Erase(key)`。
 - **测试验收**：向布隆过滤器写入 10 万个 Key，验证已存在的 Key 召回率 100%（零漏报），不存在的 Key 误判率接近 1%。
 
-### [ ] F3.4 `SSTableBuilder` 与 `SSTableReader`
+### [x] F3.4 `SSTableBuilder` 与 `SSTableReader`
 
 - **目标**：实现不可变磁盘有序文件 `.sst` 的生成与高效读取。
 - **文件位置**：`include/raftkv/storage/sstable.h`、`src/storage/sstable.cc`

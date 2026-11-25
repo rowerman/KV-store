@@ -75,6 +75,21 @@
 - 单项超过总容量或 Value 为空时返回 `InvalidArgument`，已有缓存状态保持不变。
 - 修改缓存键编码或成本公式时，应同步检查后续 SSTable Block Cache 的容量预算。
 
+## SSTable
+
+- 文件布局为 Data Blocks、Filter Block、Index Block、48 字节 Footer。
+- Data、Filter、Index 三类块末尾都有 `payload_size + CRC32` 8 字节 trailer。
+- Data Block 内按 InternalKey 严格升序，用户 Key 使用相邻前缀压缩。
+- Delete 在 SSTable 中仍保存为空 Value 的墓碑，不能提前丢弃。
+- Index 每个 Data Block 保存最后 InternalKey 和 `(offset, size)`。
+- Reader Open 时校验 Footer magic、区域边界、Filter/Index CRC、索引顺序和 Data Block
+  偏移连续性；Data Block 在首次读取时校验 CRC。
+- Get 依次执行 Bloom Filter、索引二分、LRU Block Cache、Data Block 解码和块内二分。
+- Block Cache key 为 `sstable path + block offset`，缓存内容为去掉 trailer 的 payload。
+- Iterator 使用“索引 + 当前 Block 条目”的两级结构，跨块自动加载；后续块损坏通过
+  `status()` 报告。
+- SSTable 文件必须不可变。复用同一路径覆盖内容时不得继续使用旧 Block Cache。
+
 ## 构建与依赖
 
 - `raftkv_storage` 当前只依赖 `raftkv_common`，不依赖网络、RPC 或 Protobuf。
