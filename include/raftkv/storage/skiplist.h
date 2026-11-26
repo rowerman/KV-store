@@ -11,6 +11,7 @@
 
 #include "raftkv/common/slice.h"
 #include "raftkv/storage/internal_key.h"
+#include "raftkv/storage/iterator.h"
 
 namespace raftkv {
 
@@ -65,26 +66,30 @@ class SkipList {
 };
 
 // 读取已发布节点；SkipList 必须比迭代器存活更久。
-class SkipList::Iterator {
+class SkipList::Iterator : public StorageIterator {
  public:
   explicit Iterator(const SkipList* list);
+  ~Iterator() override = default;
 
   Iterator(const Iterator&) = delete;
   Iterator& operator=(const Iterator&) = delete;
 
-  bool Valid() const { return node_ != nullptr; }
-  void SeekToFirst();
-  void Seek(Slice user_key);
-  void Seek(const InternalKey& target);
-  void Next();
+  bool Valid() const override { return node_ != nullptr; }
+  void SeekToFirst() override;
+  void Seek(Slice user_key) override;
+  void Seek(const InternalKey& target) override;
+  void Next() override;
 
-  const InternalKey& key() const { return node_->key; }
-  Slice value() const { return Slice(node_->value); }
+  const InternalKey& key() const override { return node_->key; }
+  Slice value() const override { return Slice(node_->value); }
+  const Status& status() const override { return status_; }
 
  private:
   const SkipList* list_;
   const Node* node_ = nullptr;
+  Status status_;
 };
+
 
 }  // namespace raftkv
 

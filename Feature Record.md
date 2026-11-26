@@ -216,12 +216,12 @@ sudo apt install -y \
   - `SSTableReader::NewIterator()`（两级迭代器，支持顺序扫描）。
 - **测试验收**：将 5 万条有序 KV 写入单个 `.sst` 文件，重新打开文件验证随机点查、不存在 Key 过滤、以及 `Seek` 范围遍历全部正确。
 
-### [ ] F3.5 多路归并迭代器 `MergingIterator`
+### [x] F3.5 多路归并迭代器 `MergingIterator`
 
 - **目标**：同时遍历 `MemTable`、`Immutable` 和多层 `SSTable`，自动处理新版本覆盖旧版本和墓碑（Delete）过滤，为 `Scan` 和 `Compaction` 提供统一底座。
-- **文件位置**：`include/raftkv/storage/merging_iterator.h`、`src/storage/merging_iterator.cc`
-- **核心数据结构**：持有多个子迭代器 `std::vector<Iterator*>` 和最小堆（比较规则：`user_key` 升序，同 `user_key` 时 `seq_num` 降序）。
-- **必写函数**：`SeekToFirst()`、`Seek(Slice target)`、`Next()`、`key()`、`value()`、`Valid()`。
+- **文件位置**：`include/raftkv/storage/iterator.h`、`include/raftkv/storage/merging_iterator.h`、`src/storage/merging_iterator.cc`
+- **核心数据结构**：`StorageIterator` 统一 MemTable 与 SSTable 迭代器；MergingIterator 持有多个子迭代器 `std::vector<std::unique_ptr<StorageIterator>>` 和最小堆（比较规则：`user_key` 升序，同 `user_key` 时 `seq_num` 降序）。
+- **必写函数**：`SeekToFirst()`、`Seek(Slice target)`、`Seek(InternalKey target)`、`Next()`、`key()`、`value()`、`Valid()`、`status()`。
 - **测试验收**：构造 4 个有重叠 Key 和删除墓碑的有序集合，验证归并输出严格有序、无重复 Key 且被删除的 Key 正确隐藏。
 
 ### [ ] F3.6 `VersionSet` / `MANIFEST` 与后台 Flush / Leveled Compaction

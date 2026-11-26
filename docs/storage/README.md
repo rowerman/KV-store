@@ -90,9 +90,34 @@
   `status()` 报告。
 - SSTable 文件必须不可变。复用同一路径覆盖内容时不得继续使用旧 Block Cache。
 
+## StorageIterator 与 MergingIterator
+
+- `StorageIterator` 是存储层只向前的有序 InternalKey 接口，提供 `Valid`、
+  `SeekToFirst`、两种 `Seek`、`Next`、`key`、`value` 和 `status`。
+- `SkipList::Iterator` 与 `SSTableReader::Iterator` 都继承该接口；具体迭代器不拥有
+  底层 MemTable 或 SSTable，数据源必须比迭代器存活更久。
+- `MergingIterator` 通过 `unique_ptr` 独占全部子迭代器，内部堆只保存指向这些对象
+  的非拥有裸指针，裸指针不得逃逸。
+- 最小堆使用 `CompareInternalKeys`：用户 Key 升序；同 Key 序列号降序；同序列号时
+  ValueType 数值降序。
+- 每轮归并会消费当前用户 Key 在全部子迭代器中的版本。堆顶最新版本若是墓碑，整个
+  用户 Key 隐藏；若是普通值，只输出该最新版本。
+- 当前输出的 InternalKey 和 Value 会被复制，因此子迭代器 `Next` 使内部引用失效后
+  仍可安全读取。
+- 子迭代器 Seek 或 Next 失败后，归并迭代器立即失效并保留原始错误；再次 Seek 会
+  清空旧错误并从头定位。
+- 空 children 和空数据源合法。构造后必须显式调用 `SeekToFirst` 或 `Seek`。
+- `Seek(Slice)` 定位用户 Key 的最新版本；`Seek(InternalKey)` 按完整内部顺序定位，
+  因此在同用户 Key 内会先跳过内部顺序更靠前的更新版本。
+- `MergingIterator` 自身有可变遍历状态，不允许并发调用；不同线程可以使用各自实例
+  读取同一批只读数据源。
+- 当前还没有具体 `Immutable MemTable`、VersionSet、MANIFEST 或 Compaction 装配；
+  `MergingIterator` 先作为这些模块共用的归并底座。
+
 ## 构建与依赖
 
 - `raftkv_storage` 当前只依赖 `raftkv_common`，不依赖网络、RPC 或 Protobuf。
 - 修改跳表并发模型时，必须同步检查节点发布顺序、迭代器生命周期和销毁约束。
 - 修改内部键比较规则时，必须同步更新 MemTable、后续 SSTable 比较器和磁盘格式。
+- 修改 `StorageIterator` 接口时，必须同步检查 SkipList、SSTable 和 MergingIterator。
 

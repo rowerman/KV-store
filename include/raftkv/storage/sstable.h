@@ -9,6 +9,7 @@
 #include "raftkv/common/slice.h"
 #include "raftkv/common/status.h"
 #include "raftkv/storage/internal_key.h"
+#include "raftkv/storage/iterator.h"
 
 namespace raftkv {
 
@@ -75,22 +76,22 @@ class SSTableReader {
   std::unique_ptr<Impl> impl_;
 };
 
-class SSTableReader::Iterator {
+class SSTableReader::Iterator : public StorageIterator {
  public:
-  ~Iterator();
+  ~Iterator() override;
 
   Iterator(const Iterator&) = delete;
   Iterator& operator=(const Iterator&) = delete;
 
-  bool Valid() const;
-  void SeekToFirst();
-  void Seek(Slice user_key);
-  void Seek(const InternalKey& target);
-  void Next();
+  bool Valid() const override;
+  void SeekToFirst() override;
+  void Seek(Slice user_key) override;
+  void Seek(const InternalKey& target) override;
+  void Next() override;
 
-  const InternalKey& key() const;
-  Slice value() const;
-  const Status& status() const;
+  const InternalKey& key() const override;
+  Slice value() const override;
+  const Status& status() const override;
 
  private:
   explicit Iterator(const SSTableReader* reader);
@@ -100,6 +101,7 @@ class SSTableReader::Iterator {
 
   friend class SSTableReader;
 };
+
 
 }  // namespace raftkv
 
