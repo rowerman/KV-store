@@ -9,11 +9,18 @@
 
 namespace raftkv {
 
+enum class DeletionOutputPolicy {
+  kHide,
+  kKeep,
+};
+
 // 多路归并有序子迭代器，只输出每个用户键的最新有效版本。
 class MergingIterator : public StorageIterator {
  public:
   explicit MergingIterator(
-      std::vector<std::unique_ptr<StorageIterator>> children);
+      std::vector<std::unique_ptr<StorageIterator>> children,
+      DeletionOutputPolicy deletion_policy =
+          DeletionOutputPolicy::kHide);
   ~MergingIterator() override;
 
   MergingIterator(const MergingIterator&) = delete;
@@ -46,6 +53,7 @@ class MergingIterator : public StorageIterator {
   std::string current_value_;
   Status status_;
   bool has_current_ = false;
+  DeletionOutputPolicy deletion_policy_;
 };
 
 }  // namespace raftkv

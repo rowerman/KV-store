@@ -311,6 +311,40 @@ TEST(MergingIteratorTest,
   EXPECT_EQ(iterator.status(), Status::OK());
 }
 
+TEST(MergingIteratorTest, CanExposeLatestTombstoneForCompaction) {
+  std::vector<std::unique_ptr<MemTable>> tables;
+  tables.push_back(std::make_unique<MemTable>());
+  ASSERT_TRUE(tables[0]
+                  ->Add(1, ValueType::kValue, Slice("a"),
+                        Slice("old"))
+                  .ok());
+  ASSERT_TRUE(tables[0]
+                  ->Add(2, ValueType::kDeletion, Slice("a"),
+                        Slice())
+                  .ok());
+  ASSERT_TRUE(tables[0]
+                  ->Add(3, ValueType::kValue, Slice("b"),
+                        Slice("value-b"))
+                  .ok());
+
+  MergingIterator hidden(NewChildren(tables));
+  hidden.SeekToFirst();
+  ASSERT_TRUE(hidden.Valid());
+  EXPECT_EQ(hidden.key().user_key, "b");
+
+  MergingIterator kept(
+      NewChildren(tables),
+      DeletionOutputPolicy::kKeep);
+  kept.SeekToFirst();
+  ASSERT_TRUE(kept.Valid());
+  EXPECT_EQ(kept.key().user_key, "a");
+  EXPECT_EQ(kept.key().type, ValueType::kDeletion);
+  EXPECT_TRUE(kept.value().empty());
+  kept.Next();
+  ASSERT_TRUE(kept.Valid());
+  EXPECT_EQ(kept.key().user_key, "b");
+}
+
 TEST(MergingIteratorTest, SupportsUserAndInternalKeySeek) {
   std::vector<std::unique_ptr<MemTable>> tables;
   tables.push_back(std::make_unique<MemTable>());

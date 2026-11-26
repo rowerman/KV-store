@@ -224,10 +224,10 @@ sudo apt install -y \
 - **必写函数**：`SeekToFirst()`、`Seek(Slice target)`、`Seek(InternalKey target)`、`Next()`、`key()`、`value()`、`Valid()`、`status()`。
 - **测试验收**：构造 4 个有重叠 Key 和删除墓碑的有序集合，验证归并输出严格有序、无重复 Key 且被删除的 Key 正确隐藏。
 
-### [ ] F3.6 `VersionSet` / `MANIFEST` 与后台 Flush / Leveled Compaction
+### [x] F3.6 `VersionSet` / `MANIFEST` 与后台 Flush / Leveled Compaction
 
 - **目标**：管理多层 SSTable 文件清单，在后台自动将写满的 MemTable 刷盘并合并多层文件、回收过期垃圾。
-- **文件位置**：`include/raftkv/storage/version_set.h`、`src/storage/version_set.cc`、`src/storage/compaction.cc`
+- **文件位置**：`include/raftkv/storage/version_set.h`、`src/storage/version_set.cc`、`src/storage/compaction.cc`、`src/storage/compaction_internal.h`
 - **核心数据结构**：
   - `struct FileMetaData { uint64_t file_number; uint64_t file_size; std::string smallest_key; std::string largest_key; };`
   - `struct Version`（引用计数 `std::shared_ptr<Version>`）：保存 `std::vector<FileMetaData> levels_[kNumLevels]`。

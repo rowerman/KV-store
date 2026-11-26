@@ -7,8 +7,10 @@
 namespace raftkv {
 
 MergingIterator::MergingIterator(
-    std::vector<std::unique_ptr<StorageIterator>> children)
-    : children_(std::move(children)) {
+    std::vector<std::unique_ptr<StorageIterator>> children,
+    DeletionOutputPolicy deletion_policy)
+    : children_(std::move(children)),
+      deletion_policy_(deletion_policy) {
   heap_.reserve(children_.size());
 }
 
@@ -137,7 +139,8 @@ void MergingIterator::Advance() {
       HeapPush(child);
     }
 
-    if (candidate_key.type == ValueType::kDeletion) {
+    if (candidate_key.type == ValueType::kDeletion &&
+        deletion_policy_ == DeletionOutputPolicy::kHide) {
       continue;
     }
 

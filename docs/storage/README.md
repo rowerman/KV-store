@@ -111,8 +111,36 @@
   因此在同用户 Key 内会先跳过内部顺序更靠前的更新版本。
 - `MergingIterator` 自身有可变遍历状态，不允许并发调用；不同线程可以使用各自实例
   读取同一批只读数据源。
-- 当前还没有具体 `Immutable MemTable`、VersionSet、MANIFEST 或 Compaction 装配；
-  `MergingIterator` 先作为这些模块共用的归并底座。
+- 当前还没有具体 `Immutable MemTable` 类型和 LSMTree 顶层装配；VersionSet 已提供
+  Flush、Compaction 和归并所需的基础设施。
+
+## VersionSet、MANIFEST 与 Compaction
+
+- 固定使用 L0-L3 四层；L0 文件数达到 4 触发 Compaction，L1-L3 容量分别为
+  10 MiB、100 MiB、1 GiB，输出 SSTable 目标大小约 2 MiB。
+- `Version` 保存各层 `FileMetaData`，发布后不可修改。读者持有
+  `shared_ptr<const Version>` 期间，旧文件不会被删除。
+- L0 按文件编号从新到旧排列并允许范围重叠；L1-L3 按最小用户 Key 升序且范围严格
+  不重叠。
+- `VersionEdit` 描述一次 Flush/Compaction 的新增和删除文件；Apply 先完整校验再
+  产出新 Version，失败不修改输出。
+- MANIFEST 以 Snapshot 开头，后续追加 Edit。每条记录使用
+  `payload_size + CRC32 + payload`；完整帧 CRC 错误返回 Corruption，仅尾部物理截断
+  可安全忽略并裁剪。
+- CURRENT 通过临时文件、fsync、rename 和目录 fsync 原子引用当前 MANIFEST。恢复时
+  只接受规范化的 `MANIFEST-XXXXXX` basename。
+- `LogAndApply` 的顺序固定为：校验新增文件存在且大小一致、Apply、追加 MANIFEST
+  并 fsync、发布新 Version。Manifest 写入失败后停止继续修改元数据。
+- Flush 将只读 MemTable 的全部 InternalKey 写入 L0，MANIFEST 提交成功后才删除 WAL。
+- L0 Compaction 选择全部 L0 文件；L1/L2 超容量时轮转选择文件。目标层按全部源文件
+  的最小/最大 Key 包络选择重叠文件，避免输出跨过间隔后与保留文件重叠。
+- Compaction 使用 `DeletionOutputPolicy::kKeep` 去重并保留最新墓碑。只有输出到 L3
+  且所有更高层都不包含该用户 Key 时，才允许删除墓碑。
+- 后台只有一个工作线程，Flush 优先于 Compaction。任务失败后保存错误、清空后续
+  任务并停止自动调度。
+- `WaitForBackgroundWork` 等待队列和当前任务全部结束，并触发无引用旧 Version 与
+  崩溃遗留 SSTable 的清理。
+- 当前使用单个 MANIFEST，不执行日志轮转；也不支持多进程同时打开同一数据目录。
 
 ## 构建与依赖
 
@@ -120,4 +148,5 @@
 - 修改跳表并发模型时，必须同步检查节点发布顺序、迭代器生命周期和销毁约束。
 - 修改内部键比较规则时，必须同步更新 MemTable、后续 SSTable 比较器和磁盘格式。
 - 修改 `StorageIterator` 接口时，必须同步检查 SkipList、SSTable 和 MergingIterator。
+- 修改层数、文件命名或 MANIFEST 编码时，必须同时升级格式版本并验证 CURRENT 恢复。
 
