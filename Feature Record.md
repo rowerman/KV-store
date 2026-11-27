@@ -237,7 +237,7 @@ sudo apt install -y \
   - `MaybeScheduleCompaction()`（L0 文件数达 4 个或 Ln 层超容量阈值时，挑选重叠文件用 `MergingIterator` 归并生成下一层 `.sst`，更新 `MANIFEST` 并原子切换 `Version`）。
 - **测试验收**：把 MemTable 阈值临时调小为 64 KB，连续写入与覆盖更新 5 万条数据，观察 L0→L1→L2 文件自动生成与旧文件清理，重启后能通过 `MANIFEST` 完整加载所有层级。
 
-### [ ] F3.7 `LSMTree` 顶层组装与 `CreateCheckpoint` 硬链接快照
+### [x] F3.7 `LSMTree` 顶层组装与 `CreateCheckpoint` 硬链接快照
 
 - **目标**：对外暴露完整的 `StorageEngine` 接口，并实现与 Raft Snapshot 联动的秒级 Checkpoint。
 - **文件位置**：`include/raftkv/storage/lsm_tree.h`、`src/storage/lsm_tree.cc`

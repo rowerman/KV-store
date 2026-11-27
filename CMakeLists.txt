@@ -86,6 +86,7 @@ add_library(raftkv_storage STATIC
   src/storage/bloom_filter.cc
   src/storage/compaction.cc
   src/storage/lru_cache.cc
+  src/storage/lsm_tree.cc
   src/storage/memtable.cc
   src/storage/merging_iterator.cc
   src/storage/sstable.cc
@@ -251,6 +252,12 @@ target_link_libraries(version_set_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(lsm_tree_test tests/lsm_tree_test.cc)
+target_link_libraries(lsm_tree_test PRIVATE
+  raftkv_storage
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -309,6 +316,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET version_set_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET lsm_tree_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -331,3 +341,4 @@ gtest_discover_tests(bloom_lru_test)
 gtest_discover_tests(sstable_test)
 gtest_discover_tests(merging_iterator_test)
 gtest_discover_tests(version_set_test)
+gtest_discover_tests(lsm_tree_test)

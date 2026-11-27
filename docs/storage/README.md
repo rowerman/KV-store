@@ -111,8 +111,8 @@
   因此在同用户 Key 内会先跳过内部顺序更靠前的更新版本。
 - `MergingIterator` 自身有可变遍历状态，不允许并发调用；不同线程可以使用各自实例
   读取同一批只读数据源。
-- 当前还没有具体 `Immutable MemTable` 类型和 LSMTree 顶层装配；VersionSet 已提供
-  Flush、Compaction 和归并所需的基础设施。
+- Immutable 由只读 MemTable 加对应 WAL 路径表示，LSMTree 负责轮转和背压；
+  VersionSet 负责 Flush、Compaction 和版本切换。
 
 ## VersionSet、MANIFEST 与 Compaction
 
@@ -142,6 +142,28 @@
   崩溃遗留 SSTable 的清理。
 - 当前使用单个 MANIFEST，不执行日志轮转；也不支持多进程同时打开同一数据目录。
 
+## LSMTree 与 Checkpoint
+
+- `StorageEngine` 暴露 Put、Delete、Get、Scan、CreateCheckpoint 和
+  RestoreFromCheckpoint；`LSMTree` 是具体实现。
+- 每次 Put/Delete 先 WAL Append 和 fsync，再写 Active MemTable。成功返回后，
+  进程崩溃仍可通过 WAL 恢复。
+- 每个 MemTable 对应一个 `WAL-XXXXXX.log`。达到 64 KiB 后冻结为 Immutable，创建
+  新 MemTable 和新 WAL，并把旧表交给 VersionSet 后台 Flush。
+- 默认最多保留 2 个 Immutable；达到上限后写线程等待后台任务，防止内存无界增长。
+- Open 先恢复 VersionSet，再按编号顺序重放 WAL。序号不大于 MANIFEST
+  `last_sequence` 的记录已经落盘，会被跳过。
+- Get 顺序为 Active、Immutable 新到旧、L0 新到旧、L1-L3；最新墓碑返回 NotFound。
+- Scan 使用半开区间 `[start, end)`，通过 MergingIterator 合并 Active、Immutable 和
+  全部 SSTable，墓碑不输出。
+- SSTableReader 按文件编号缓存，所有 Reader 共享 LSMTree 的 LRU Block Cache。
+- Checkpoint 先强制 Flush Active MemTable 并等待全部后台任务，再对 CURRENT、
+  MANIFEST 和全部活跃 SSTable 创建硬链接；不复制数据，也不包含 WAL。
+- Restore 校验 Checkpoint 后用两次目录 rename 替换当前数据目录；失败时把目录
+  改回原位并重新打开旧数据。
+- Put/Delete/Checkpoint/Restore 使用独占锁；Get/Scan 在整个操作期间持有共享锁。
+- 当前 Checkpoint 与恢复要求源和目标位于同一文件系统，且不执行 WAL 分段合并。
+
 ## 构建与依赖
 
 - `raftkv_storage` 当前只依赖 `raftkv_common`，不依赖网络、RPC 或 Protobuf。
@@ -149,4 +171,5 @@
 - 修改内部键比较规则时，必须同步更新 MemTable、后续 SSTable 比较器和磁盘格式。
 - 修改 `StorageIterator` 接口时，必须同步检查 SkipList、SSTable 和 MergingIterator。
 - 修改层数、文件命名或 MANIFEST 编码时，必须同时升级格式版本并验证 CURRENT 恢复。
+- 修改 WAL 命名或 LSMTree 目录布局时，必须同步更新崩溃恢复和 Checkpoint/Restore。
 
