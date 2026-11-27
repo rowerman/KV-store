@@ -62,8 +62,8 @@
 - `RaftTransport` 的请求 Handler 和出站回包都通过共享 `ActorEventSink` 投递事件，
   不捕获 `RaftNode::Impl` 的 `this`。Actor 停止后新请求以 Timeout 完成，迟到回包
   被丢弃。
-- Actor 使用 `steady_clock` 计算 10ms Tick；事件积压跨过多个周期时只补一次 Tick，
-  不突发补发全部错过的周期。
+- Actor 使用 `steady_clock` 计算 Tick；事件积压时在事件批次内检查截止时间并补一次
+  Tick，避免大量 Propose 延迟心跳，也不突发补发全部错过周期。
 - `GetStatus` 读取 Actor 发布的原子镜像，不参与协议决策，也不给核心状态增加锁。
 - 选举超时从 `[election_timeout_min_ms, election_timeout_max_ms]` 独立随机选择，
   默认 150-300ms；Leader 默认每 50ms 广播一次空 AppendEntries 心跳。
@@ -73,9 +73,21 @@
   term 和 `voted_for` 先写入 `RaftLog`，写盘成功后才响应。
 - 最近收到合法 Leader 心跳的节点拒绝 Pre-Vote；正式投票拒绝不会重置接收方计时，
   避免多个 Candidate 被反复同步到下一轮。
-- Leader 当选后立即广播空心跳。心跳只维持 Leader 身份并校验日志边界，不追加或
-  提交日志；日志复制、快速回退和 No-Op 提交留给 F4.5。
+- Leader 当选后先追加当前 term 的 No-Op，并初始化每个 Follower 的
+  `next_index/match_index`。
+- AppendEntries 每次最多携带 64 条日志；同一 peer 最多一个复制请求在途，成功后
+  立即发送下一批。请求序号和 prev/entry count 随回包返回，迟到回包不会覆盖新进度。
+- 复制请求在途时，Tick 仍可发送独立心跳，避免复制回包在事件队列中排队导致
+  Follower 选举超时。
+- Follower 返回 `conflict_term/conflict_index`；Leader 按冲突 term 整段回退，
+  Follower 在首个不同 term 的 index 截断后修复日志。
+- Leader 对自身 LastIndex 和各 peer match_index 排序，只有当前 term 的多数派 index
+  才能推进 commit。Follower 使用 `min(leader_commit, matched_index)` 保守推进。
+- `StateMachine::Apply` 在 Actor 线程按 log index 递增执行；No-Op 跳过业务 Apply。
+- Leader 的 Propose 在日志提交并 Apply 后回调；失去 Leader 身份时 pending 回调
+  返回 NotLeader。
 - 任何更高 term 的请求或响应都会使 PreCandidate、Candidate 或 Leader 降级为
   Follower。
-- Propose 与 ReadIndex 在 F4.5/F4.6 实现前仍返回 NotLeader。
+- ReadIndex 在 F4.6 实现前仍返回 NotLeader；Snapshot 与成员变更分别留给 F4.7、
+  F4.8。
 

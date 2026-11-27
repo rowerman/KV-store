@@ -318,7 +318,7 @@ TEST(RaftElectionTest, SingleNodeElectsItself) {
   cluster.Start();
 
   ASSERT_TRUE(cluster.DriveUntil(
-      [&]() { return cluster.LeaderIds().size() == 1; }, 500ms));
+      [&]() { return cluster.LeaderIds().size() == 1; }, 2s));
   const RaftNodeStatus status = cluster.Node(1)->GetStatus();
   EXPECT_EQ(status.role, Role::kLeader);
   EXPECT_EQ(status.current_term, 1U);

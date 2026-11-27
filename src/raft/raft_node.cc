@@ -4,13 +4,16 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <random>
 #include <string>
 #include <system_error>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -30,6 +33,7 @@ enum class Lifecycle {
 
 inline constexpr uint64_t kMaxTimerIntervalMs =
     24ULL * 60ULL * 60ULL * 1000ULL;
+inline constexpr uint64_t kMaxEntriesPerAppend = 64;
 
 class ActorEventSink {
  public:
@@ -78,6 +82,13 @@ bool IsLogAtLeastAsUpToDate(
   return candidate_last_index >= local_last_index;
 }
 
+class NoopStateMachine final : public StateMachine {
+ public:
+  Status Apply(uint64_t, const std::string&) override {
+    return Status::OK();
+  }
+};
+
 }  // namespace
 
 struct RaftNode::Impl {
@@ -85,18 +96,23 @@ struct RaftNode::Impl {
 
   Impl(RaftNodeOptions node_options,
        std::unique_ptr<RaftTransport> node_transport,
-       std::unique_ptr<RaftLog> node_log)
+       std::unique_ptr<RaftLog> node_log,
+       std::unique_ptr<StateMachine> node_state_machine)
       : options(std::move(node_options)),
         transport(std::move(node_transport)),
         log(std::move(node_log)),
+        state_machine(std::move(node_state_machine)),
         current_term(log->hard_state().current_term),
         voted_for(log->hard_state().voted_for),
-        commit_index(log->LastIndex()),
+        commit_index(log->snapshot_marker().last_included_index),
+        last_applied(commit_index),
         status_role(Role::kFollower),
         status_term(current_term),
         status_voted_for(voted_for.value_or(0)),
         status_leader(0),
-        status_commit(commit_index) {
+        status_commit(commit_index),
+        status_last_log(log->LastIndex()),
+        status_last_applied(last_applied) {
     election_random.seed(MakeElectionSeed(options));
     InstallHandlers();
   }
@@ -118,6 +134,26 @@ struct RaftNode::Impl {
   Status ObserveHigherTerm(uint64_t term, Clock::time_point now);
   Status BroadcastVoteRequests(bool is_pre_vote);
   Status BroadcastHeartbeat();
+  Status ReplicateToPeer(uint32_t peer_id);
+  Status AppendNoop();
+  Status HandlePropose(const ProposeEvent& event);
+  Status AdvanceLeaderCommit();
+  void ResetReplicationProgress();
+  void FailPendingProposals(const Status& status);
+  Status ValidateAppendEntries(
+      const proto::AppendEntriesRequest& request) const;
+  Status BuildConflictResponse(
+      uint64_t prev_log_index,
+      proto::AppendEntriesResponse* response) const;
+  Status RepairFollowerLog(
+      const proto::AppendEntriesRequest& request,
+      uint64_t* matched_index);
+  Status AdvanceCommitIndex(uint64_t candidate_index);
+  Status ApplyCommitted();
+  Status RetryPeerAfterConflict(
+      uint32_t peer_id,
+      uint64_t request_prev_log_index,
+      const proto::AppendEntriesResponse& response);
   Status OnRequestVoteRequest(const RequestVoteRequestEvent& event);
   Status OnAppendEntriesRequest(
       const AppendEntriesRequestEvent& event);
@@ -159,11 +195,16 @@ struct RaftNode::Impl {
         voted_for.value_or(0), std::memory_order_relaxed);
     status_leader.store(leader_id, std::memory_order_relaxed);
     status_commit.store(commit_index, std::memory_order_relaxed);
+    status_last_log.store(
+        log->LastIndex(), std::memory_order_relaxed);
+    status_last_applied.store(
+        last_applied, std::memory_order_relaxed);
   }
 
   RaftNodeOptions options;
   std::unique_ptr<RaftTransport> transport;
   std::unique_ptr<RaftLog> log;
+  std::unique_ptr<StateMachine> state_machine;
   std::shared_ptr<ActorEventSink> event_sink =
       std::make_shared<ActorEventSink>();
 
@@ -181,6 +222,7 @@ struct RaftNode::Impl {
   std::optional<uint32_t> voted_for;
   uint32_t leader_id = 0;
   uint64_t commit_index = 0;
+  uint64_t last_applied = 0;
   std::mt19937_64 election_random;
   Clock::time_point election_deadline{};
   Clock::time_point heartbeat_deadline{};
@@ -192,9 +234,22 @@ struct RaftNode::Impl {
   std::atomic<uint32_t> status_voted_for;
   std::atomic<uint32_t> status_leader;
   std::atomic<uint64_t> status_commit;
+  std::atomic<uint64_t> status_last_log;
+  std::atomic<uint64_t> status_last_applied;
 
   std::atomic<uint64_t> processed_events{0};
   std::atomic<uint64_t> tick_count{0};
+
+  struct PeerReplicationState {
+    uint64_t next_index = 1;
+    uint64_t match_index = 0;
+    uint64_t inflight_sequence = 0;
+    bool inflight = false;
+  };
+
+  std::unordered_map<uint32_t, PeerReplicationState> replication_;
+  std::map<uint64_t, ProposeCallback> pending_proposals_;
+  uint64_t next_append_sequence_ = 1;
 };
 
 void RaftNode::Impl::InstallHandlers() {
@@ -310,6 +365,356 @@ Status RaftNode::Impl::PersistHardState(
   return Status::OK();
 }
 
+void RaftNode::Impl::ResetReplicationProgress() {
+  replication_.clear();
+  const uint64_t next_index = log->LastIndex() + 1;
+  for (uint32_t peer_id : options.peers) {
+    replication_[peer_id].next_index = next_index;
+  }
+}
+
+Status RaftNode::Impl::AppendNoop() {
+  if (log->LastIndex() >=
+      std::numeric_limits<uint64_t>::max() - 1) {
+    return Status::Corruption("raft log index is exhausted");
+  }
+  proto::LogEntry entry;
+  entry.set_term(current_term);
+  entry.set_index(log->LastIndex() + 1);
+  entry.set_entry_type(proto::ENTRY_TYPE_NO_OP);
+  std::vector<proto::LogEntry> entries;
+  entries.push_back(std::move(entry));
+  Status status = log->Append(std::move(entries));
+  if (!status.ok()) {
+    return status;
+  }
+  PublishStatus();
+  return Status::OK();
+}
+
+Status RaftNode::Impl::HandlePropose(const ProposeEvent& event) {
+  if (role != Role::kLeader) {
+    if (event.done != nullptr) {
+      event.done(Status::NotLeader("raft node is not leader"));
+    }
+    return Status::OK();
+  }
+  if (log->LastIndex() >=
+      std::numeric_limits<uint64_t>::max() - 1) {
+    const Status status =
+        Status::Corruption("raft log index is exhausted");
+    if (event.done != nullptr) {
+      event.done(status);
+    }
+    return status;
+  }
+
+  proto::LogEntry entry;
+  entry.set_term(current_term);
+  entry.set_index(log->LastIndex() + 1);
+  entry.set_entry_type(proto::ENTRY_TYPE_NORMAL);
+  entry.set_payload(event.command);
+  const uint64_t index = entry.index();
+  std::vector<proto::LogEntry> entries;
+  entries.push_back(std::move(entry));
+  Status status = log->Append(std::move(entries));
+  if (!status.ok()) {
+    if (event.done != nullptr) {
+      event.done(status);
+    }
+    return status;
+  }
+
+  if (event.done != nullptr) {
+    pending_proposals_[index] = event.done;
+  }
+  PublishStatus();
+  for (uint32_t peer_id : options.peers) {
+    status = ReplicateToPeer(peer_id);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return AdvanceLeaderCommit();
+}
+
+void RaftNode::Impl::FailPendingProposals(const Status& status) {
+  std::map<uint64_t, ProposeCallback> pending =
+      std::move(pending_proposals_);
+  pending_proposals_.clear();
+  for (auto& entry : pending) {
+    if (entry.second != nullptr) {
+      entry.second(status);
+    }
+  }
+}
+
+Status RaftNode::Impl::ApplyCommitted() {
+  if (last_applied > commit_index) {
+    return Status::Corruption(
+        "raft last applied exceeds commit index");
+  }
+  while (last_applied < commit_index) {
+    const uint64_t index = last_applied + 1;
+    proto::LogEntry entry;
+    Status status = log->EntryAt(index, &entry);
+    if (!status.ok()) {
+      return status;
+    }
+    if (entry.entry_type() == proto::ENTRY_TYPE_NORMAL) {
+      status = state_machine->Apply(index, entry.payload());
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    last_applied = index;
+    status_last_applied.store(
+        last_applied, std::memory_order_relaxed);
+
+    const auto pending = pending_proposals_.find(index);
+    if (pending != pending_proposals_.end()) {
+      ProposeCallback done = std::move(pending->second);
+      pending_proposals_.erase(pending);
+      if (done != nullptr) {
+        done(Status::OK());
+      }
+    }
+  }
+  return Status::OK();
+}
+
+Status RaftNode::Impl::AdvanceCommitIndex(uint64_t candidate_index) {
+  if (candidate_index <= commit_index) {
+    return Status::OK();
+  }
+  if (candidate_index > log->LastIndex()) {
+    return Status::InvalidArgument(
+        "raft commit index exceeds last log index");
+  }
+  commit_index = candidate_index;
+  status_commit.store(commit_index, std::memory_order_relaxed);
+  return ApplyCommitted();
+}
+
+Status RaftNode::Impl::AdvanceLeaderCommit() {
+  if (role != Role::kLeader) {
+    return Status::OK();
+  }
+
+  std::vector<uint64_t> matched_indices;
+  matched_indices.reserve(options.peers.size() + 1);
+  matched_indices.push_back(log->LastIndex());
+  for (uint32_t peer_id : options.peers) {
+    const auto replication = replication_.find(peer_id);
+    matched_indices.push_back(
+        replication == replication_.end()
+            ? 0
+            : replication->second.match_index);
+  }
+  std::sort(
+      matched_indices.begin(), matched_indices.end(),
+      std::greater<uint64_t>());
+  const size_t majority = matched_indices.size() / 2 + 1;
+  const uint64_t candidate_index = matched_indices[majority - 1];
+  if (candidate_index <= commit_index) {
+    return Status::OK();
+  }
+
+  uint64_t candidate_term = 0;
+  Status status = log->TermAt(candidate_index, &candidate_term);
+  if (!status.ok()) {
+    return status;
+  }
+  if (candidate_term != current_term) {
+    return Status::OK();
+  }
+  return AdvanceCommitIndex(candidate_index);
+}
+
+Status RaftNode::Impl::ValidateAppendEntries(
+    const proto::AppendEntriesRequest& request) const {
+  if (request.entries_size() == 0) {
+    return Status::OK();
+  }
+  if (request.prev_log_index() ==
+      std::numeric_limits<uint64_t>::max()) {
+    return Status::InvalidArgument(
+        "append entries prev index is exhausted");
+  }
+
+  uint64_t expected_index = request.prev_log_index() + 1;
+  uint64_t previous_term = request.prev_log_term();
+  for (int index = 0; index < request.entries_size(); ++index) {
+    const proto::LogEntry& entry = request.entries(index);
+    if (entry.index() != expected_index ||
+        entry.term() == 0 ||
+        entry.term() > request.term() ||
+        entry.term() < previous_term) {
+      return Status::InvalidArgument(
+          "append entries payload is invalid");
+    }
+    previous_term = entry.term();
+    if (expected_index ==
+        std::numeric_limits<uint64_t>::max()) {
+      if (index + 1 != request.entries_size()) {
+        return Status::InvalidArgument(
+            "append entries index is exhausted");
+      }
+    } else {
+      ++expected_index;
+    }
+  }
+  return Status::OK();
+}
+
+Status RaftNode::Impl::BuildConflictResponse(
+    uint64_t prev_log_index,
+    proto::AppendEntriesResponse* response) const {
+  if (response == nullptr) {
+    return Status::InvalidArgument(
+        "append entries response is null");
+  }
+  const uint64_t last_index = log->LastIndex();
+  if (prev_log_index > last_index) {
+    response->set_conflict_term(0);
+    response->set_conflict_index(last_index + 1);
+    return Status::OK();
+  }
+
+  uint64_t conflict_term = 0;
+  Status status = log->TermAt(prev_log_index, &conflict_term);
+  if (!status.ok()) {
+    if (status.code() != Code::kNotFound) {
+      return status;
+    }
+    response->set_conflict_term(
+        log->snapshot_marker().last_included_term);
+    response->set_conflict_index(log->FirstIndex());
+    return Status::OK();
+  }
+
+  uint64_t conflict_index = prev_log_index;
+  while (conflict_index > log->FirstIndex()) {
+    uint64_t previous_term = 0;
+    status = log->TermAt(conflict_index - 1, &previous_term);
+    if (!status.ok() || previous_term != conflict_term) {
+      break;
+    }
+    --conflict_index;
+  }
+  response->set_conflict_term(conflict_term);
+  response->set_conflict_index(conflict_index);
+  return Status::OK();
+}
+
+Status RaftNode::Impl::RepairFollowerLog(
+    const proto::AppendEntriesRequest& request,
+    uint64_t* matched_index) {
+  if (matched_index == nullptr) {
+    return Status::InvalidArgument(
+        "append entries match output is null");
+  }
+  if (request.entries_size() == 0) {
+    *matched_index = request.prev_log_index();
+    return Status::OK();
+  }
+
+  const uint64_t last_index = log->LastIndex();
+  size_t append_from = static_cast<size_t>(request.entries_size());
+  for (int index = 0; index < request.entries_size(); ++index) {
+    const proto::LogEntry& incoming = request.entries(index);
+    if (incoming.index() > last_index) {
+      if (incoming.index() != last_index + 1) {
+        return Status::Corruption(
+            "append entries left a log gap");
+      }
+      append_from = static_cast<size_t>(index);
+      break;
+    }
+
+    proto::LogEntry local;
+    Status status = log->EntryAt(incoming.index(), &local);
+    if (!status.ok()) {
+      return status;
+    }
+    if (local.term() == incoming.term()) {
+      continue;
+    }
+    status = log->TruncateSuffix(incoming.index());
+    if (!status.ok()) {
+      return status;
+    }
+    append_from = static_cast<size_t>(index);
+    break;
+  }
+
+  if (append_from <
+      static_cast<size_t>(request.entries_size())) {
+    std::vector<proto::LogEntry> suffix;
+    suffix.reserve(
+        static_cast<size_t>(request.entries_size()) - append_from);
+    for (size_t index = append_from;
+         index < static_cast<size_t>(request.entries_size());
+         ++index) {
+      suffix.push_back(request.entries(static_cast<int>(index)));
+    }
+    Status status = log->Append(std::move(suffix));
+    if (!status.ok()) {
+      return status;
+    }
+  }
+
+  *matched_index =
+      request.prev_log_index() +
+      static_cast<uint64_t>(request.entries_size());
+  if (log->LastIndex() < *matched_index) {
+    return Status::Corruption(
+        "append entries matched index mismatch");
+  }
+  PublishStatus();
+  return Status::OK();
+}
+
+Status RaftNode::Impl::RetryPeerAfterConflict(
+    uint32_t peer_id,
+    uint64_t request_prev_log_index,
+    const proto::AppendEntriesResponse& response) {
+  const auto replication = replication_.find(peer_id);
+  if (replication == replication_.end()) {
+    return Status::OK();
+  }
+
+  uint64_t next_index = response.conflict_index();
+  if (response.conflict_term() != 0) {
+    uint64_t search_index =
+        std::min(request_prev_log_index, log->LastIndex());
+    while (search_index >= log->FirstIndex()) {
+      uint64_t term = 0;
+      Status status = log->TermAt(search_index, &term);
+      if (!status.ok()) {
+        if (status.code() == Code::kNotFound) {
+          break;
+        }
+        return status;
+      }
+      if (term == response.conflict_term()) {
+        next_index = search_index + 1;
+        break;
+      }
+      if (search_index == 0 ||
+          search_index == log->FirstIndex()) {
+        break;
+      }
+      --search_index;
+    }
+  }
+
+  next_index = std::max<uint64_t>(1, next_index);
+  next_index = std::min(next_index, log->LastIndex() + 1);
+  replication->second.next_index = next_index;
+  return ReplicateToPeer(peer_id);
+}
+
 bool RaftNode::Impl::IsConfiguredPeer(uint32_t peer_id) const {
   return std::find(
              options.peers.begin(), options.peers.end(), peer_id) !=
@@ -345,6 +750,8 @@ Status RaftNode::Impl::StartPreVote(Clock::time_point now) {
   if (current_term == std::numeric_limits<uint64_t>::max()) {
     return Status::Corruption("raft term is exhausted");
   }
+  FailPendingProposals(
+      Status::NotLeader("raft leader stepped down"));
   role = Role::kPreCandidate;
   leader_id = 0;
   ClearElectionVotes();
@@ -361,6 +768,8 @@ Status RaftNode::Impl::BecomeCandidate(Clock::time_point now) {
   if (current_term == std::numeric_limits<uint64_t>::max()) {
     return Status::Corruption("raft term is exhausted");
   }
+  FailPendingProposals(
+      Status::NotLeader("raft leader stepped down"));
   Status status =
       PersistHardState(current_term + 1, options.node_id);
   if (!status.ok()) {
@@ -379,12 +788,21 @@ Status RaftNode::Impl::BecomeCandidate(Clock::time_point now) {
 }
 
 Status RaftNode::Impl::BecomeLeader(Clock::time_point now) {
+  Status status = AppendNoop();
+  if (!status.ok()) {
+    return status;
+  }
   role = Role::kLeader;
   leader_id = options.node_id;
   ClearElectionVotes();
+  ResetReplicationProgress();
   ResetElectionDeadline(now);
   ResetHeartbeatDeadline(now);
   PublishStatus();
+  status = AdvanceLeaderCommit();
+  if (!status.ok()) {
+    return status;
+  }
   return BroadcastHeartbeat();
 }
 
@@ -393,6 +811,7 @@ Status RaftNode::Impl::ObserveHigherTerm(
   if (term <= current_term) {
     return Status::OK();
   }
+  const bool was_leader = role == Role::kLeader;
   Status status = PersistHardState(term, std::nullopt);
   if (!status.ok()) {
     return status;
@@ -400,6 +819,11 @@ Status RaftNode::Impl::ObserveHigherTerm(
   role = Role::kFollower;
   leader_id = 0;
   ClearElectionVotes();
+  replication_.clear();
+  if (was_leader) {
+    FailPendingProposals(
+        Status::NotLeader("raft leader stepped down"));
+  }
   ResetElectionDeadline(now);
   PublishStatus();
   return Status::OK();
@@ -437,7 +861,80 @@ Status RaftNode::Impl::BroadcastVoteRequests(bool is_pre_vote) {
   return Status::OK();
 }
 
+Status RaftNode::Impl::ReplicateToPeer(uint32_t peer_id) {
+  if (role != Role::kLeader || !IsConfiguredPeer(peer_id)) {
+    return Status::OK();
+  }
+  const auto replication = replication_.find(peer_id);
+  if (replication == replication_.end()) {
+    return Status::Corruption("raft peer replication state is missing");
+  }
+  PeerReplicationState& progress = replication->second;
+  if (progress.inflight) {
+    return Status::OK();
+  }
+  if (next_append_sequence_ ==
+      std::numeric_limits<uint64_t>::max()) {
+    return Status::Corruption("raft append sequence is exhausted");
+  }
+
+  progress.next_index = std::max<uint64_t>(1, progress.next_index);
+  progress.next_index =
+      std::min(progress.next_index, log->LastIndex() + 1);
+  const uint64_t prev_log_index = progress.next_index - 1;
+  uint64_t prev_log_term = 0;
+  Status status = log->TermAt(prev_log_index, &prev_log_term);
+  if (!status.ok()) {
+    return status;
+  }
+
+  proto::AppendEntriesRequest request;
+  request.set_term(current_term);
+  request.set_leader_id(options.node_id);
+  request.set_prev_log_index(prev_log_index);
+  request.set_prev_log_term(prev_log_term);
+  request.set_leader_commit(commit_index);
+
+  const uint64_t last_index = log->LastIndex();
+  uint64_t next_index = progress.next_index;
+  uint64_t entry_count = 0;
+  while (next_index <= last_index &&
+         entry_count < kMaxEntriesPerAppend) {
+    proto::LogEntry entry;
+    status = log->EntryAt(next_index, &entry);
+    if (!status.ok()) {
+      return status;
+    }
+    *request.add_entries() = std::move(entry);
+    if (next_index == std::numeric_limits<uint64_t>::max()) {
+      break;
+    }
+    ++next_index;
+    ++entry_count;
+  }
+
+  const uint64_t sequence = next_append_sequence_++;
+  progress.inflight = true;
+  progress.inflight_sequence = sequence;
+  const std::weak_ptr<ActorEventSink> weak_sink = event_sink;
+  transport->SendAppendEntries(
+      peer_id, request,
+      [weak_sink, peer_id, sequence, prev_log_index, entry_count](
+          Status response_status,
+          proto::AppendEntriesResponse response) {
+        if (const auto sink = weak_sink.lock()) {
+          sink->Post(AppendEntriesResponseEvent{
+              peer_id, sequence, prev_log_index, entry_count,
+              std::move(response_status), std::move(response)});
+        }
+      });
+  return Status::OK();
+}
+
 Status RaftNode::Impl::BroadcastHeartbeat() {
+  if (role != Role::kLeader) {
+    return Status::OK();
+  }
   uint64_t last_log_term = 0;
   Status status = log->LastTerm(&last_log_term);
   if (!status.ok()) {
@@ -450,18 +947,27 @@ Status RaftNode::Impl::BroadcastHeartbeat() {
   request.set_prev_log_index(log->LastIndex());
   request.set_prev_log_term(last_log_term);
   request.set_leader_commit(commit_index);
-
+  const uint64_t prev_log_index = request.prev_log_index();
   const std::weak_ptr<ActorEventSink> weak_sink = event_sink;
   for (uint32_t peer_id : options.peers) {
+    const auto replication = replication_.find(peer_id);
+    if (replication == replication_.end() ||
+        !replication->second.inflight) {
+      Status replicate_status = ReplicateToPeer(peer_id);
+      if (!replicate_status.ok()) {
+        return replicate_status;
+      }
+      continue;
+    }
     transport->SendAppendEntries(
         peer_id, request,
-        [weak_sink, peer_id](
+        [weak_sink, peer_id, prev_log_index](
             Status response_status,
             proto::AppendEntriesResponse response) {
           if (const auto sink = weak_sink.lock()) {
             sink->Post(AppendEntriesResponseEvent{
-                peer_id, std::move(response_status),
-                std::move(response)});
+                peer_id, 0, prev_log_index, 0,
+                std::move(response_status), std::move(response)});
           }
         });
   }
@@ -604,23 +1110,49 @@ Status RaftNode::Impl::OnAppendEntriesRequest(
   ResetElectionDeadline(now);
   PublishStatus();
 
-  // F4.4 只广播空心跳，日志复制由 F4.5 处理。
-  if (event.request.entries_size() != 0) {
+  if (!ValidateAppendEntries(event.request).ok()) {
     complete(Status::OK(), false);
     return Status::OK();
   }
   if (event.request.prev_log_index() > log->LastIndex()) {
+    Status status = BuildConflictResponse(
+        event.request.prev_log_index(), &response);
+    if (!status.ok()) {
+      complete(status, false);
+      return status;
+    }
     complete(Status::OK(), false);
     return Status::OK();
   }
 
   uint64_t previous_term = 0;
-  const Status term_status = log->TermAt(
+  Status status = log->TermAt(
       event.request.prev_log_index(), &previous_term);
-  if (!term_status.ok() ||
+  if (!status.ok() ||
       previous_term != event.request.prev_log_term()) {
+    status = BuildConflictResponse(
+        event.request.prev_log_index(), &response);
+    if (!status.ok()) {
+      complete(status, false);
+      return status;
+    }
     complete(Status::OK(), false);
     return Status::OK();
+  }
+
+  uint64_t matched_index = 0;
+  status = RepairFollowerLog(event.request, &matched_index);
+  if (!status.ok()) {
+    complete(status, false);
+    return status;
+  }
+
+  const uint64_t follower_commit =
+      std::min(event.request.leader_commit(), matched_index);
+  status = AdvanceCommitIndex(follower_commit);
+  if (!status.ok()) {
+    complete(status, false);
+    return status;
   }
   complete(Status::OK(), true);
   return Status::OK();
@@ -703,13 +1235,64 @@ Status RaftNode::Impl::OnRequestVoteResponse(
 
 Status RaftNode::Impl::OnAppendEntriesResponse(
     const AppendEntriesResponseEvent& event) {
-  if (!event.status.ok() || !IsConfiguredPeer(event.peer_id)) {
+  if (!IsConfiguredPeer(event.peer_id)) {
     return Status::OK();
   }
-  if (event.response.term() > current_term) {
-    return ObserveHigherTerm(event.response.term(), Clock::now());
+  if (event.status.ok() &&
+      event.response.term() > current_term) {
+    return ObserveHigherTerm(
+        event.response.term(), Clock::now());
   }
-  return Status::OK();
+  const auto replication = replication_.find(event.peer_id);
+  if (replication == replication_.end() ||
+      !replication->second.inflight ||
+      replication->second.inflight_sequence !=
+          event.request_sequence) {
+    return Status::OK();
+  }
+  replication->second.inflight = false;
+  replication->second.inflight_sequence = 0;
+
+  if (!event.status.ok()) {
+    return Status::OK();
+  }
+  if (role != Role::kLeader ||
+      event.response.term() < current_term) {
+    return Status::OK();
+  }
+
+  if (event.response.success()) {
+    if (event.request_entry_count >
+        std::numeric_limits<uint64_t>::max() -
+            event.request_prev_log_index) {
+      return Status::Corruption("raft matched index overflow");
+    }
+    const uint64_t matched =
+        event.request_prev_log_index + event.request_entry_count;
+    if (matched > log->LastIndex()) {
+      return Status::Corruption(
+          "raft follower matched beyond leader log");
+    }
+    if (matched > replication->second.match_index) {
+      replication->second.match_index = matched;
+      replication->second.next_index =
+          matched == std::numeric_limits<uint64_t>::max()
+              ? matched
+              : matched + 1;
+    }
+    Status status = AdvanceLeaderCommit();
+    if (!status.ok()) {
+      return status;
+    }
+    if (replication->second.next_index <= log->LastIndex()) {
+      return ReplicateToPeer(event.peer_id);
+    }
+    return Status::OK();
+  }
+
+  return RetryPeerAfterConflict(
+      event.peer_id, event.request_prev_log_index,
+      event.response);
 }
 
 Status RaftNode::Impl::OnInstallSnapshotResponse(
@@ -818,6 +1401,10 @@ RaftNodeStatus RaftNode::Impl::GetStatus() const {
       status_leader.load(std::memory_order_relaxed);
   status.commit_index =
       status_commit.load(std::memory_order_relaxed);
+  status.last_log_index =
+      status_last_log.load(std::memory_order_relaxed);
+  status.last_applied =
+      status_last_applied.load(std::memory_order_relaxed);
   status.processed_events =
       processed_events.load(std::memory_order_relaxed);
   status.tick_count =
@@ -861,12 +1448,7 @@ Status RaftNode::Impl::Step(const RaftEvent& event) {
     return OnInstallSnapshotResponse(*response_event);
   }
   if (const auto* proposal = std::get_if<ProposeEvent>(&event)) {
-    if (proposal->done != nullptr) {
-      proposal->done(Status::NotLeader(
-          "raft node has not elected a leader"));
-    }
-    PublishStatus();
-    return Status::OK();
+    return HandlePropose(*proposal);
   }
   if (const auto* read = std::get_if<ReadIndexEvent>(&event)) {
     if (read->done != nullptr) {
@@ -917,7 +1499,24 @@ void RaftNode::Impl::Run() {
         if (std::holds_alternative<TickEvent>(event)) {
           tick_count.fetch_add(1, std::memory_order_relaxed);
         }
-        if (!step_status.ok() || IsStopping()) {
+        if (!step_status.ok()) {
+          should_stop = true;
+          break;
+        }
+
+        const auto after_event = Clock::now();
+        if (after_event >= next_tick) {
+          const TickEvent implicit_tick;
+          const Status tick_status = Step(implicit_tick);
+          processed_events.fetch_add(1, std::memory_order_relaxed);
+          tick_count.fetch_add(1, std::memory_order_relaxed);
+          if (!tick_status.ok()) {
+            should_stop = true;
+            break;
+          }
+          next_tick = after_event + interval;
+        }
+        if (IsStopping()) {
           should_stop = true;
           break;
         }
@@ -940,6 +1539,8 @@ void RaftNode::Impl::Run() {
     }
   }
 
+  FailPendingProposals(
+      Status::NotLeader("raft actor stopped"));
   event_sink->Close();
   {
     std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -962,7 +1563,19 @@ Status RaftNode::Create(
     std::unique_ptr<RaftTransport> transport,
     std::unique_ptr<RaftLog> log,
     std::unique_ptr<RaftNode>* node) {
-  if (node == nullptr || transport == nullptr || log == nullptr) {
+  return Create(
+      std::move(options), std::move(transport), std::move(log),
+      std::make_unique<NoopStateMachine>(), node);
+}
+
+Status RaftNode::Create(
+    RaftNodeOptions options,
+    std::unique_ptr<RaftTransport> transport,
+    std::unique_ptr<RaftLog> log,
+    std::unique_ptr<StateMachine> state_machine,
+    std::unique_ptr<RaftNode>* node) {
+  if (node == nullptr || transport == nullptr || log == nullptr ||
+      state_machine == nullptr) {
     return Status::InvalidArgument("raft node dependency is null");
   }
   if (options.node_id == 0) {
@@ -996,7 +1609,8 @@ Status RaftNode::Create(
   }
 
   auto impl = std::make_unique<Impl>(
-      std::move(options), std::move(transport), std::move(log));
+      std::move(options), std::move(transport), std::move(log),
+      std::move(state_machine));
   *node = std::unique_ptr<RaftNode>(
       new RaftNode(std::move(impl)));
   return Status::OK();

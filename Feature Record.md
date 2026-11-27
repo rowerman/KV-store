@@ -293,7 +293,7 @@ sudo apt install -y \
 - **测试验收**：在 `SimTransport` 下启动 3 节点，验证 1 秒内选出唯一 Leader；隔离 Leader 后剩余 2 节点选出新 Leader；恢复旧 Leader 后其自动降级为 Follower 且不引发新一轮选举风暴。
 - **实现补充**：完成随机化选举超时、Pre-Vote、正式投票持久化、日志新旧校验、空心跳保活和更高 term 降级；Actor 入站请求与出站回包统一经线程安全事件桥接。新增 7 个选举测试，Debug、ASan/UBSan、TSan 均通过。
 
-### [ ] F4.5 心跳保活、日志复制、快速回退与 No-Op 提交
+### [x] F4.5 心跳保活、日志复制、快速回退与 No-Op 提交
 
 - **目标**：实现稳定的多副本日志同步，保证所有健康节点按完全相同的顺序提交日志。
 - **核心数据结构**（仅 Leader 维护）：`std::unordered_map<uint32_t, uint64_t> next_index_`、`match_index_`。
@@ -302,6 +302,7 @@ sudo apt install -y \
   - Follower 日志不匹配时返回 `conflict_term` 和 `conflict_index`，Leader 一步回退整段冲突任期。
   - Leader 统计 `match_index_` 中位数（多数派已复制且属于当前 `term` 的最大索引），推进 `commit_index_` 并推送给 Apply 回调。
 - **测试验收**：在 `SimTransport` 下模拟连续提交 500 条日志、中途反复制造网络分区与 10% 随机丢包，验证最终所有恢复节点的已提交日志逐条 100% 相同。
+- **实现补充**：完成 No-Op、per-peer next/match、每批 64 条复制、请求序号防迟到覆盖、conflict term/index 快速回退、当前 term 多数派提交、Actor 线程顺序 Apply 和 Propose 生命周期；事件积压期间仍会触发 Tick 与独立心跳。新增 4 个复制测试，Debug、ASan/UBSan、TSan 均通过。
 
 ### [ ] F4.6 `ReadIndex` 线性一致读
 

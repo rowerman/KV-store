@@ -11,6 +11,7 @@
 
 #include "raftkv/common/status.h"
 #include "raftkv/raft/raft_log.h"
+#include "raftkv/raft/state_machine.h"
 #include "raftkv/raft/transport.h"
 
 namespace raftkv {
@@ -40,6 +41,8 @@ struct RaftNodeStatus {
   std::optional<uint32_t> voted_for;
   uint32_t leader_id = 0;
   uint64_t commit_index = 0;
+  uint64_t last_log_index = 0;
+  uint64_t last_applied = 0;
   uint64_t processed_events = 0;
   uint64_t tick_count = 0;
   bool running = false;
@@ -74,6 +77,9 @@ struct RequestVoteResponseEvent {
 
 struct AppendEntriesResponseEvent {
   uint32_t peer_id = 0;
+  uint64_t request_sequence = 0;
+  uint64_t request_prev_log_index = 0;
+  uint64_t request_entry_count = 0;
   Status status;
   proto::AppendEntriesResponse response;
 };
@@ -84,9 +90,11 @@ struct InstallSnapshotResponseEvent {
   proto::InstallSnapshotResponse response;
 };
 
+using ProposeCallback = std::function<void(Status)>;
+
 struct ProposeEvent {
   std::string command;
-  std::function<void(Status)> done;
+  ProposeCallback done;
 };
 
 struct ReadIndexEvent {
@@ -115,6 +123,13 @@ class RaftNode final {
       RaftNodeOptions options,
       std::unique_ptr<RaftTransport> transport,
       std::unique_ptr<RaftLog> log,
+      std::unique_ptr<RaftNode>* node);
+
+  static Status Create(
+      RaftNodeOptions options,
+      std::unique_ptr<RaftTransport> transport,
+      std::unique_ptr<RaftLog> log,
+      std::unique_ptr<StateMachine> state_machine,
       std::unique_ptr<RaftNode>* node);
 
   ~RaftNode();
