@@ -51,3 +51,20 @@
 - `SimNetwork` 的注册表、故障状态和事件队列由同一 mutex 保护，支持多个发送线程；
   投递和响应回调只在调用 `AdvanceBy` 的线程执行。
 
+## RaftNode Actor
+
+- `RaftNode` 使用一个 `std::thread` 驱动 `MpscQueue<RaftEvent>`；网络、存储和上层
+  调用只能投递事件，不能直接修改 Raft 核心字段。
+- `RaftEvent` 覆盖 Tick、三类 RPC 请求/响应、Propose、ReadIndex 和 Stop。
+- 生命周期为 Created、Running、Stopping、Stopped；Start 幂等，Stop 后不支持重启。
+- 外部 Stop 通过 join 等待 Actor 退出；Actor 线程内 Stop 只投递停止事件，不 join
+  自身。
+- `RaftTransport` 的三个请求 Handler 只复制请求和完成回调，再调用 `PostEvent`。
+  Actor 停止后新请求以 Timeout 完成。
+- Actor 使用 `steady_clock` 计算 10ms Tick；事件积压跨过多个周期时只补一次 Tick，
+  不突发补发全部错过的周期。
+- `GetStatus` 读取 Actor 发布的原子镜像，不参与协议决策，也不给核心状态增加锁。
+- F4.3 的三类 RPC 响应用于保证骨架阶段回调闭环：当前 term 正确，但投票和日志匹配
+  固定返回拒绝；实际选举和复制规则从 F4.4/F4.5 开始实现。
+- Propose 与 ReadIndex 在未实现 Leader 前返回 NotLeader。
+

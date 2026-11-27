@@ -272,7 +272,7 @@ sudo apt install -y \
 - **测试验收**：两个模拟节点互发测试消息，开启分区后消息被拦截，恢复分区后重新送达。
 - **实现补充**：`RaftTransport` 同时提供三类请求 Handler；`SimTransport` 使用虚拟毫秒时钟、固定随机种子和 `AdvanceBy()` 驱动延迟、乱序、丢包、宕机、双向分区及单向断链。
 
-### [ ] F4.3 `RaftNode` Actor 单线程事件循环骨架
+### [x] F4.3 `RaftNode` Actor 单线程事件循环骨架
 
 - **目标**：搭建 Raft 的单线程事件驱动核心，确保所有状态修改都在同一个线程完成，零锁竞争。
 - **文件位置**：`include/raftkv/raft/raft_node.h`、`src/raft/raft_node.cc`
@@ -281,6 +281,7 @@ sudo apt install -y \
   - `struct RaftEvent`（用 `std::variant` 封装：收到各类 RPC 请求/响应、定时 Tick、上层 Propose、ReadIndex 请求）。
   - `MpscQueue<RaftEvent> event_queue_` + 独立工作线程 `raft_thread_` + `10ms` 定时 Tick 触发器。
 - **必写函数**：`Start()`、`Stop()`、`PostEvent(RaftEvent)`、`Step(const RaftEvent& ev)`（核心状态分发函数）。
+- **实现补充**：Actor 线程、Start/Stop 生命周期、10ms Tick、Transport Handler 桥接和线程安全状态快照已完成；三类 RPC 在 F4.3 返回明确拒绝占位响应。
 
 ### [ ] F4.4 Leader 选举与 Pre-Vote 预投票
 
