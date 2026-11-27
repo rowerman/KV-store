@@ -283,7 +283,7 @@ sudo apt install -y \
 - **必写函数**：`Start()`、`Stop()`、`PostEvent(RaftEvent)`、`Step(const RaftEvent& ev)`（核心状态分发函数）。
 - **实现补充**：Actor 线程、Start/Stop 生命周期、10ms Tick、Transport Handler 桥接和线程安全状态快照已完成；三类 RPC 在 F4.3 返回明确拒绝占位响应。
 
-### [ ] F4.4 Leader 选举与 Pre-Vote 预投票
+### [x] F4.4 Leader 选举与 Pre-Vote 预投票
 
 - **目标**：实现集群启动自动选主、Leader 失联自动重选，并防止孤立节点恢复后破坏健康集群。
 - **关键参数与逻辑**：
@@ -291,6 +291,7 @@ sudo apt install -y \
   - 超时先进入 `kPreCandidate`，发 `is_pre_vote = true` 的 `RequestVote`（不递增 `currentTerm`）；获得多数派认可后再转 `kCandidate` 递增 `term` 正式拉票。
   - 严格检查候选人日志新旧程度（先比 `last_log_term`，再比 `last_log_index`）。
 - **测试验收**：在 `SimTransport` 下启动 3 节点，验证 1 秒内选出唯一 Leader；隔离 Leader 后剩余 2 节点选出新 Leader；恢复旧 Leader 后其自动降级为 Follower 且不引发新一轮选举风暴。
+- **实现补充**：完成随机化选举超时、Pre-Vote、正式投票持久化、日志新旧校验、空心跳保活和更高 term 降级；Actor 入站请求与出站回包统一经线程安全事件桥接。新增 7 个选举测试，Debug、ASan/UBSan、TSan 均通过。
 
 ### [ ] F4.5 心跳保活、日志复制、快速回退与 No-Op 提交
 

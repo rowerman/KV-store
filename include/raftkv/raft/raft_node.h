@@ -26,12 +26,18 @@ struct RaftNodeOptions {
   uint32_t node_id = 0;
   std::vector<uint32_t> peers;
   uint64_t tick_interval_ms = 10;
+  uint64_t heartbeat_interval_ms = 50;
+  uint64_t election_timeout_min_ms = 150;
+  uint64_t election_timeout_max_ms = 300;
+  // 0 表示使用运行时随机源；测试使用非 0 值获得可重复结果。
+  uint64_t random_seed = 0;
 };
 
 // 线程安全的状态镜像，供 Server 和测试观察。
 struct RaftNodeStatus {
   Role role = Role::kFollower;
   uint64_t current_term = 0;
+  std::optional<uint32_t> voted_for;
   uint32_t leader_id = 0;
   uint64_t commit_index = 0;
   uint64_t processed_events = 0;
@@ -61,6 +67,7 @@ struct InstallSnapshotRequestEvent {
 
 struct RequestVoteResponseEvent {
   uint32_t peer_id = 0;
+  bool is_pre_vote = false;
   Status status;
   proto::RequestVoteResponse response;
 };
