@@ -263,13 +263,14 @@ sudo apt install -y \
 - **必写函数**：`Append(entries)`、`TruncateSuffix(from_index)`、`CompactPrefix(up_to_index, last_term)`、`TermAt(index)`、`LastIndex()`、`SaveHardState(term, voted_for)`。
 - **测试验收**：验证追加、截断、快照前截断以及重启恢复后各项 `TermAt` 与 `LastIndex` 均精确一致。
 
-### [ ] F4.2 `RaftTransport` 抽象与确定性内存模拟网络 `SimTransport`
+### [x] F4.2 `RaftTransport` 抽象与确定性内存模拟网络 `SimTransport`
 
 - **目标**：把网络通信抽象为接口，在内存里模拟 3/5 节点互通，并支持注入丢包、延迟、单向/双向网络分区。
 - **文件位置**：`include/raftkv/raft/transport.h`、`tests/chaos/sim_transport.h`
 - **必写函数**：
   - `SimTransport::DropNode(id)`（模拟宕机）、`Partition(groupA, groupB)`（模拟脑裂）、`Heal()`（恢复网络）、`SetDropRate(0.1)`（模拟 10% 丢包）。
 - **测试验收**：两个模拟节点互发测试消息，开启分区后消息被拦截，恢复分区后重新送达。
+- **实现补充**：`RaftTransport` 同时提供三类请求 Handler；`SimTransport` 使用虚拟毫秒时钟、固定随机种子和 `AdvanceBy()` 驱动延迟、乱序、丢包、宕机、双向分区及单向断链。
 
 ### [ ] F4.3 `RaftNode` Actor 单线程事件循环骨架
 

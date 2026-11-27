@@ -30,3 +30,24 @@
 - 同一目录只允许一个 `RaftLog` 实例打开；当前 `Append` 每次独立 fsync，
   group commit 留给后续 Actor 批量调度。
 
+## RaftTransport 与 SimTransport
+
+- `RaftTransport` 同时定义 RequestVote、AppendEntries、InstallSnapshot 的发送方法
+  和对应接收 Handler，真实 RPC 与测试网络共享同一接口。
+- 发送回调参数中的 `Status` 只表示传输结果；Raft 投票拒绝、日志冲突等协议结果仍以
+  `Status::OK()` 和响应中的 `success`/`vote_granted` 字段表示。
+- 请求 Handler 显式接收来源节点编号，响应回调最多生效一次。Handler 可以同步或
+  异步调用 `done`。
+- `SimTransport` 位于 `tests/chaos/`，只用于测试。它不做生产构建依赖，后续
+  `RealRaftTransport` 才连接 Phase 2 的真实 RPC。
+- `SimNetwork` 使用虚拟毫秒时钟和按 `(timestamp, sequence)` 排序的事件队列；
+  `AdvanceBy` 在调用线程串行执行消息，不创建后台线程。
+- 延迟在 `[min_latency, max_latency]` 内随机选择；固定随机种子下投递顺序可重复。
+- 丢包、节点宕机、双向分区和单向断链都在发送时判断。被接受的消息后续不会因故障
+  状态变化而撤销。
+- 请求到达 Handler 后，响应作为独立网络消息再次执行延迟、丢包和分区判断。
+- `Partition` 只拦截两个不相交节点组之间的双向消息；`Heal` 清除分区和有向断链，
+  但不恢复 `DropNode` 的节点。
+- `SimNetwork` 的注册表、故障状态和事件队列由同一 mutex 保护，支持多个发送线程；
+  投递和响应回调只在调用 `AdvanceBy` 的线程执行。
+
