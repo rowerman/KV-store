@@ -126,6 +126,14 @@ target_link_libraries(raftkv_proto PUBLIC
   protobuf::libprotobuf
 )
 
+add_library(raftkv_raft STATIC
+  src/raft/raft_log.cc
+)
+target_link_libraries(raftkv_raft PUBLIC
+  raftkv_common
+  raftkv_proto
+)
+
 add_library(raftkv_rpc STATIC
   src/rpc/frame_codec.cc
   src/rpc/rpc_client.cc
@@ -258,6 +266,12 @@ target_link_libraries(lsm_tree_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(raft_log_test tests/raft_log_test.cc)
+target_link_libraries(raft_log_test PRIVATE
+  raftkv_raft
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -319,6 +333,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET lsm_tree_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET raft_log_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -342,3 +359,4 @@ gtest_discover_tests(sstable_test)
 gtest_discover_tests(merging_iterator_test)
 gtest_discover_tests(version_set_test)
 gtest_discover_tests(lsm_tree_test)
+gtest_discover_tests(raft_log_test)

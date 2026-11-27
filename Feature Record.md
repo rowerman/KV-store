@@ -253,13 +253,13 @@ sudo apt install -y \
 
 > **阶段目标**：先不接真实网络和 LSM-Tree，用纯内存模拟网络把 Raft 协议本身测到固若金汤（MIT 6.824 黄金实践）。
 
-### [ ] F4.1 `RaftLog` 与分段持久化 `RaftWAL`
+### [x] F4.1 `RaftLog` 与分段持久化 `RaftWAL`
 
 - **目标**：持久化存储 Raft 的 `currentTerm`、`votedFor` 和日志条目，支持按 `index` 快速读取与冲突截断。
 - **文件位置**：`include/raftkv/raft/raft_log.h`、`src/raft/raft_log.cc`
 - **核心数据结构**：
   - 持久化元数据文件 `raft_meta.bin`（写入临时文件 + `fsync` + `rename` 保证原子更新）。
-  - 日志文件 `raft_log.wal` + 内存索引表 `std::vector<LogEntry>`（或偏移数组）+ `uint64_t snapshot_last_index_` / `snapshot_last_term_`。
+  - 日志文件 `RAFT-LOG-XXXXXX.wal` 分段存储 + 内存 `(segment, offset, size)` 索引表 + `uint64_t snapshot_last_index_` / `snapshot_last_term_`。
 - **必写函数**：`Append(entries)`、`TruncateSuffix(from_index)`、`CompactPrefix(up_to_index, last_term)`、`TermAt(index)`、`LastIndex()`、`SaveHardState(term, voted_for)`。
 - **测试验收**：验证追加、截断、快照前截断以及重启恢复后各项 `TermAt` 与 `LastIndex` 均精确一致。
 
