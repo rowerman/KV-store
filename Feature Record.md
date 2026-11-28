@@ -385,7 +385,7 @@ sudo apt install -y \
   触发退出。新增单节点生命周期和三节点真实 TCP 集成测试，Debug、ASan/UBSan、
   TSan 均 2/2 通过，TSan 每项连续重复 10 轮通过。
 
-### [ ] F5.4 `KVClient` SDK 与交互式命令行工具 `raftkv_cli`
+### [x] F5.4 `KVClient` SDK 与交互式命令行工具 `raftkv_cli`
 
 - **目标**：封装屏蔽分布式复杂度的客户端，让调用者像用单机哈希表一样使用集群。
 - **文件位置**：`include/raftkv/client/kv_client.h`、`src/client/cli_main.cc`
@@ -393,6 +393,11 @@ sudo apt install -y \
   - 自动生成唯一 `client_id_` 与单调递增 `seq_num_`。
   - 发送写请求遇到 `ERR_NOT_LEADER` 时，自动根据响应里的 `leader_hint` 切换目标节点并携带**相同 `seq_num_`**重试；遇到超时则轮询尝试其他节点。
 - **测试验收**：本机开 3 个终端分别启动 3 个 `raftkv_server`，再用 `raftkv_cli` 执行 `put hello world`、`get hello`、`scan a z 10`、`del hello`，观察全部正常返回。
+- **实现补充**：新增异步 `KVClient`、节点独立 RpcClient 连接池、动态 Leader Hint、
+  非零客户端 ID、写请求串行化和固定序号重试。写结果不确定时禁止继续写，避免
+  SessionTable 跳过旧序号。Get/Scan 支持超时和 NotLeader 换节点重试。新增
+  `raftkv_cli`、方法常量公共头和三个真实 KVServer 的 SDK 端到端测试。Debug、
+  ASan/UBSan、TSan 均 10/10 通过，TSan 每项连续重复 10 轮通过。
 
 ---
 

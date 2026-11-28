@@ -7,17 +7,13 @@
 #include <vector>
 
 #include "raftkv/raft/raft_node.h"
+#include "raftkv/rpc/kv_methods.h"
 #include "raftkv/server/real_raft_transport.h"
 #include "raftkv/storage/lsm_tree.h"
 
 namespace raftkv {
 
 class EventLoop;
-
-inline constexpr uint32_t kKvPutRpcMethod = 201;
-inline constexpr uint32_t kKvDeleteRpcMethod = 202;
-inline constexpr uint32_t kKvGetRpcMethod = 203;
-inline constexpr uint32_t kKvScanRpcMethod = 204;
 
 // 完整服务的节点地址；Port 同时也是本地 RPC 监听端口。
 struct KVServerOptions {

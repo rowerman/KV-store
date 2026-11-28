@@ -166,6 +166,26 @@ target_link_libraries(raftkv_rpc PUBLIC
   raftkv_proto
 )
 
+add_library(raftkv_client STATIC
+  src/client/kv_client.cc
+)
+target_link_libraries(raftkv_client PUBLIC
+  raftkv_rpc
+)
+
+add_executable(raftkv_cli
+  src/client/cli_main.cc
+)
+target_link_libraries(raftkv_cli PRIVATE
+  raftkv_client
+)
+
+add_test(NAME raftkv_cli_help COMMAND raftkv_cli --help)
+add_test(NAME raftkv_cli_requires_endpoints COMMAND raftkv_cli)
+set_tests_properties(raftkv_cli_requires_endpoints PROPERTIES
+  WILL_FAIL TRUE
+)
+
 add_executable(smoke_test tests/smoke_test.cc)
 target_link_libraries(smoke_test PRIVATE
   raftkv_build_options
@@ -266,6 +286,13 @@ target_link_libraries(real_raft_transport_test PRIVATE
 
 add_executable(kv_server_test tests/kv_server_test.cc)
 target_link_libraries(kv_server_test PRIVATE
+  raftkv_server_lib
+  GTest::gtest_main
+)
+
+add_executable(kv_client_test tests/kv_client_test.cc)
+target_link_libraries(kv_client_test PRIVATE
+  raftkv_client
   raftkv_server_lib
   GTest::gtest_main
 )
@@ -388,6 +415,9 @@ target_link_libraries(raft_conf_change_test PRIVATE
 )
 
 if(RAFTKV_TSAN_TEST_LAUNCHER)
+  set_property(TARGET raftkv_cli PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
@@ -437,6 +467,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
   set_property(TARGET kv_server_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
+  set_property(TARGET kv_client_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
   set_property(TARGET memtable_test PROPERTY CROSSCOMPILING_EMULATOR
@@ -507,6 +540,7 @@ gtest_discover_tests(session_table_test)
 gtest_discover_tests(kv_state_machine_test)
 gtest_discover_tests(real_raft_transport_test)
 gtest_discover_tests(kv_server_test)
+gtest_discover_tests(kv_client_test)
 gtest_discover_tests(memtable_test)
 gtest_discover_tests(wal_test)
 gtest_discover_tests(bloom_lru_test)
