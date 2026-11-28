@@ -33,6 +33,23 @@ message KvDeleteRequest {
   bytes key = 3;
 }
 
+// Raft 状态机执行的 KV 命令类型。
+enum KvCommandType {
+  KV_COMMAND_TYPE_UNSPECIFIED = 0;
+  KV_COMMAND_TYPE_PUT = 1;
+  KV_COMMAND_TYPE_DELETE = 2;
+}
+
+// 内部幂等写命令；同一字段含义在 Raft 恢复后保持不变。
+message KvCommand {
+  KvCommandType type = 1;
+  uint64 client_id = 2;
+  uint64 seq_num = 3;
+  bytes key = 4;
+  bytes value = 5;
+}
+
+
 // Get 请求；可选择线性一致读或允许本地读。
 message KvGetRequest {
   bytes key = 1;

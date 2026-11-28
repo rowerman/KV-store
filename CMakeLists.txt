@@ -136,6 +136,16 @@ target_link_libraries(raftkv_raft PUBLIC
   raftkv_proto
 )
 
+add_library(raftkv_server STATIC
+  src/server/kv_state_machine.cc
+  src/server/session_table.cc
+)
+target_link_libraries(raftkv_server PUBLIC
+  raftkv_raft
+  raftkv_storage
+  raftkv_proto
+)
+
 add_library(raftkv_rpc STATIC
   src/rpc/frame_codec.cc
   src/rpc/rpc_client.cc
@@ -223,6 +233,18 @@ target_link_libraries(frame_codec_test PRIVATE
 add_executable(rpc_test tests/rpc_test.cc)
 target_link_libraries(rpc_test PRIVATE
   raftkv_rpc
+  GTest::gtest_main
+)
+
+add_executable(session_table_test tests/session_table_test.cc)
+target_link_libraries(session_table_test PRIVATE
+  raftkv_server
+  GTest::gtest_main
+)
+
+add_executable(kv_state_machine_test tests/kv_state_machine_test.cc)
+target_link_libraries(kv_state_machine_test PRIVATE
+  raftkv_server
   GTest::gtest_main
 )
 
@@ -383,6 +405,12 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET rpc_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET session_table_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
+  set_property(TARGET kv_state_machine_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
   set_property(TARGET memtable_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
@@ -447,6 +475,8 @@ gtest_discover_tests(tcp_server_test)
 gtest_discover_tests(tcp_client_test)
 gtest_discover_tests(frame_codec_test)
 gtest_discover_tests(rpc_test)
+gtest_discover_tests(session_table_test)
+gtest_discover_tests(kv_state_machine_test)
 gtest_discover_tests(memtable_test)
 gtest_discover_tests(wal_test)
 gtest_discover_tests(bloom_lru_test)

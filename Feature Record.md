@@ -343,7 +343,7 @@ sudo apt install -y \
 
 > **阶段目标**：像拼乐高一样，把 Phase 2（网络 RPC）、Phase 3（LSM-Tree）和 Phase 4（Raft）真正串成一个可运行的服务。
 
-### [ ] F5.1 幂等去重表 `SessionTable` 与 `KVStateMachine`
+### [x] F5.1 幂等去重表 `SessionTable` 与 `KVStateMachine`
 
 - **目标**：防止网络超时重试导致同一写请求被执行两次，并把 Raft Apply 和 LSM-Tree 粘合在一起。
 - **文件位置**：`include/raftkv/server/session_table.h`、`include/raftkv/server/kv_state_machine.h`
@@ -351,6 +351,11 @@ sudo apt install -y \
 - **必写函数**：
   - `KVStateMachine::Apply(log_index, cmd_bytes)`：反序列化 KV 命令 → 查 `SessionTable` 去重 → 调用 `LSMTree::Put/Delete` → 更新 `SessionTable` → 唤醒挂起的客户端 RPC 回调。
   - `TakeSnapshot` / `LoadSnapshot`：把 `SessionTable` 序列化文件一并打包进 LSM-Tree Checkpoint 目录，确保快照恢复后去重状态不丢失。
+- **实现补充**：新增内部 `KvCommand`，完成 Put/Delete 解码、按客户端最大 `seq_num`
+  去重、存储成功后再推进水位。SessionTable 使用确定性单帧格式、整体 CRC32、临时
+  文件 fsync 和原子 rename。状态机快照目录包含 `lsm/` 与 `session_table.bin`；
+  LoadSnapshot 通过硬链接临时副本恢复 LSM，使源快照可重复加载。新增 10 个用例，
+  Debug、ASan/UBSan、TSan 均 10/10 通过。网络响应关联留给 F5.3。
 
 ### [ ] F5.2 真实网络传输实现 `RealRaftTransport`
 
