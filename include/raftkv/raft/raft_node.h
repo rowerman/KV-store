@@ -26,6 +26,8 @@ enum class Role {
 struct RaftNodeOptions {
   uint32_t node_id = 0;
   std::vector<uint32_t> peers;
+  // false 表示加入节点在首次收到包含自身的配置前不发起选举。
+  bool initially_voting = true;
   uint64_t tick_interval_ms = 10;
   uint64_t heartbeat_interval_ms = 50;
   uint64_t election_timeout_min_ms = 150;
@@ -50,6 +52,8 @@ struct RaftNodeStatus {
   uint64_t last_log_index = 0;
   uint64_t last_applied = 0;
   uint64_t snapshot_index = 0;
+  uint64_t configuration_index = 0;
+  std::vector<uint32_t> voters;
   uint64_t processed_events = 0;
   uint64_t tick_count = 0;
   bool running = false;
@@ -110,6 +114,14 @@ struct ProposeEvent {
   ProposeCallback done;
 };
 
+using ConfChangeCallback = std::function<void(Status)>;
+
+struct ProposeConfChangeEvent {
+  proto::ConfChange change;
+  // 配置日志提交并应用后完成。
+  ConfChangeCallback done;
+};
+
 using ReadIndexCallback = std::function<void(Status)>;
 
 struct ReadIndexEvent {
@@ -129,6 +141,7 @@ using RaftEvent = std::variant<
     AppendEntriesResponseEvent,
     InstallSnapshotResponseEvent,
     ProposeEvent,
+    ProposeConfChangeEvent,
     ReadIndexEvent,
     StopEvent>;
 

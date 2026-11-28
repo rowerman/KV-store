@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <random>
+#include <set>
 #include <string>
 #include <system_error>
 #include <sys/stat.h>
@@ -48,9 +49,230 @@ inline constexpr char kInstallMarkerName[] = "INSTALLING";
 inline constexpr char kIncomingSnapshotName[] = "incoming.bundle";
 inline constexpr char kSnapshotStateName[] = "state";
 inline constexpr char kSnapshotBundleName[] = "snapshot.bundle";
+inline constexpr char kConfigurationFileName[] = "raft_conf.bin";
 inline constexpr char kInstallMagic[] = "RFTINST1";
+inline constexpr char kConfigurationMagic[] = "RFTCONF1";
+inline constexpr uint32_t kConfigurationFormatVersion = 1;
 
 namespace fs = std::filesystem;
+
+struct RaftConfiguration {
+  uint64_t index = 0;
+  std::set<uint32_t> voters;
+};
+
+Status ValidateConfChange(const proto::ConfChange& change) {
+  if (change.node_id() == 0) {
+    return Status::InvalidArgument(
+        "raft configuration node id cannot be zero");
+  }
+  switch (change.type()) {
+    case proto::CONF_CHANGE_ADD_NODE:
+    case proto::CONF_CHANGE_REMOVE_NODE:
+      return Status::OK();
+    default:
+      return Status::InvalidArgument(
+          "raft configuration change type is invalid");
+  }
+}
+
+Status EncodeConfChangePayload(
+    const proto::ConfChange& change, std::string* payload) {
+  if (payload == nullptr) {
+    return Status::InvalidArgument(
+        "raft configuration payload output is null");
+  }
+  Status status = ValidateConfChange(change);
+  if (!status.ok()) {
+    return status;
+  }
+  std::string encoded;
+  if (!change.SerializeToString(&encoded)) {
+    return Status::Corruption(
+        "serialize raft configuration change");
+  }
+  payload->swap(encoded);
+  return Status::OK();
+}
+
+Status DecodeConfChangePayload(
+    const std::string& payload, proto::ConfChange* change) {
+  if (change == nullptr) {
+    return Status::InvalidArgument(
+        "raft configuration change output is null");
+  }
+  proto::ConfChange decoded;
+  if (!decoded.ParseFromString(payload)) {
+    return Status::Corruption(
+        "parse raft configuration change");
+  }
+  Status status = ValidateConfChange(decoded);
+  if (!status.ok()) {
+    return Status::Corruption(status.message());
+  }
+  *change = std::move(decoded);
+  return Status::OK();
+}
+
+Status ApplyConfChange(
+    const proto::ConfChange& change, uint64_t index,
+    RaftConfiguration* configuration) {
+  if (configuration == nullptr) {
+    return Status::InvalidArgument(
+        "raft configuration output is null");
+  }
+  Status status = ValidateConfChange(change);
+  if (!status.ok()) {
+    return status;
+  }
+
+  RaftConfiguration updated = *configuration;
+  switch (change.type()) {
+    case proto::CONF_CHANGE_ADD_NODE:
+      if (!updated.voters.insert(change.node_id()).second) {
+        return Status::InvalidArgument(
+            "raft configuration node already exists");
+      }
+      break;
+    case proto::CONF_CHANGE_REMOVE_NODE:
+      if (updated.voters.erase(change.node_id()) == 0) {
+        return Status::InvalidArgument(
+            "raft configuration node does not exist");
+      }
+      if (updated.voters.empty()) {
+        return Status::InvalidArgument(
+            "raft configuration cannot remove the last voter");
+      }
+      break;
+    default:
+      return Status::InvalidArgument(
+          "raft configuration change type is invalid");
+  }
+  updated.index = index;
+  *configuration = std::move(updated);
+  return Status::OK();
+}
+
+Status EncodeConfiguration(
+    const RaftConfiguration& configuration, std::string* output) {
+  if (output == nullptr) {
+    return Status::InvalidArgument(
+        "raft configuration output is null");
+  }
+  if (configuration.voters.empty() ||
+      configuration.voters.count(0) != 0 ||
+      configuration.voters.size() >
+          std::numeric_limits<uint32_t>::max()) {
+    return Status::InvalidArgument(
+        "raft configuration voters are invalid");
+  }
+
+  const size_t voter_bytes =
+      configuration.voters.size() * sizeof(uint32_t);
+  if (voter_bytes >
+      std::numeric_limits<size_t>::max() -
+          (sizeof(kConfigurationMagic) - 1 +
+           sizeof(uint32_t) * 3 + sizeof(uint64_t))) {
+    return Status::InvalidArgument(
+        "raft configuration is too large");
+  }
+  std::string encoded;
+  encoded.reserve(
+      sizeof(kConfigurationMagic) - 1 + sizeof(uint32_t) +
+      sizeof(uint64_t) + sizeof(uint32_t) + voter_bytes +
+      sizeof(uint32_t));
+  encoded.append(
+      kConfigurationMagic, sizeof(kConfigurationMagic) - 1);
+
+  const auto append_u32 = [&](uint32_t value) {
+    const size_t offset = encoded.size();
+    encoded.resize(offset + sizeof(uint32_t));
+    EncodeFixed32(encoded.data() + offset, value);
+  };
+  const auto append_u64 = [&](uint64_t value) {
+    const size_t offset = encoded.size();
+    encoded.resize(offset + sizeof(uint64_t));
+    EncodeFixed64(encoded.data() + offset, value);
+  };
+
+  append_u32(kConfigurationFormatVersion);
+  append_u64(configuration.index);
+  append_u32(
+      static_cast<uint32_t>(configuration.voters.size()));
+  for (uint32_t voter : configuration.voters) {
+    append_u32(voter);
+  }
+  const size_t checksum_offset = encoded.size();
+  append_u32(Crc32(encoded.data(), checksum_offset));
+  output->swap(encoded);
+  return Status::OK();
+}
+
+Status DecodeConfiguration(
+    const std::string& encoded,
+    RaftConfiguration* configuration) {
+  if (configuration == nullptr) {
+    return Status::InvalidArgument(
+        "raft configuration output is null");
+  }
+  constexpr size_t kFixedSize =
+      sizeof(kConfigurationMagic) - 1 + sizeof(uint32_t) +
+      sizeof(uint64_t) + sizeof(uint32_t) + sizeof(uint32_t);
+  if (encoded.size() < kFixedSize ||
+      std::memcmp(
+          encoded.data(), kConfigurationMagic,
+          sizeof(kConfigurationMagic) - 1) != 0) {
+    return Status::Corruption("invalid raft configuration file");
+  }
+
+  size_t offset = sizeof(kConfigurationMagic) - 1;
+  const uint32_t version = DecodeFixed32(encoded.data() + offset);
+  offset += sizeof(uint32_t);
+  if (version != kConfigurationFormatVersion) {
+    return Status::Corruption(
+        "unsupported raft configuration version");
+  }
+  const uint64_t index = DecodeFixed64(encoded.data() + offset);
+  offset += sizeof(uint64_t);
+  const uint32_t voter_count =
+      DecodeFixed32(encoded.data() + offset);
+  offset += sizeof(uint32_t);
+  if (voter_count == 0 ||
+      voter_count >
+          (std::numeric_limits<size_t>::max() - kFixedSize) /
+              sizeof(uint32_t)) {
+    return Status::Corruption(
+        "invalid raft configuration voter count");
+  }
+  const size_t voter_bytes =
+      static_cast<size_t>(voter_count) * sizeof(uint32_t);
+  if (encoded.size() != kFixedSize + voter_bytes) {
+    return Status::Corruption(
+        "invalid raft configuration file size");
+  }
+
+  RaftConfiguration decoded;
+  decoded.index = index;
+  for (uint32_t i = 0; i < voter_count; ++i) {
+    const uint32_t voter = DecodeFixed32(encoded.data() + offset);
+    offset += sizeof(uint32_t);
+    if (voter == 0 ||
+        (!decoded.voters.empty() &&
+         voter <= *decoded.voters.rbegin())) {
+      return Status::Corruption(
+          "invalid raft configuration voter list");
+    }
+    decoded.voters.insert(voter);
+  }
+  const uint32_t checksum =
+      DecodeFixed32(encoded.data() + offset);
+  if (Crc32(encoded.data(), offset) != checksum) {
+    return Status::Corruption(
+        "raft configuration checksum mismatch");
+  }
+  *configuration = std::move(decoded);
+  return Status::OK();
+}
 
 class ActorEventSink {
  public:
@@ -254,6 +476,71 @@ Status ReadFile(const std::string& path, std::string* output) {
   return Status::OK();
 }
 
+Status WriteConfigurationFile(
+    const std::string& path,
+    const RaftConfiguration& configuration) {
+  std::string encoded;
+  Status status = EncodeConfiguration(configuration, &encoded);
+  if (!status.ok()) {
+    return status;
+  }
+
+  const std::string temporary = path + ".tmp";
+  const int fd = ::open(
+      temporary.c_str(),
+      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return MakeIoError("create raft configuration file");
+  }
+  status = WriteAll(
+      fd, encoded.data(), encoded.size(),
+      "write raft configuration file");
+  if (status.ok() && ::fsync(fd) < 0) {
+    status = MakeIoError("fsync raft configuration file");
+  }
+  const int close_result = ::close(fd);
+  if (status.ok() && close_result < 0) {
+    status = MakeIoError("close raft configuration file");
+  }
+  if (!status.ok()) {
+    ::unlink(temporary.c_str());
+    return status;
+  }
+  if (::rename(temporary.c_str(), path.c_str()) < 0) {
+    status = MakeIoError("rename raft configuration file");
+    ::unlink(temporary.c_str());
+    return status;
+  }
+
+  const fs::path parent = fs::path(path).parent_path();
+  return SyncDirectory(
+      parent.empty() ? std::string(".") : parent.string());
+}
+
+Status ReadConfigurationFile(
+    const std::string& path, bool* exists,
+    RaftConfiguration* configuration) {
+  if (exists == nullptr || configuration == nullptr) {
+    return Status::InvalidArgument(
+        "raft configuration file output is null");
+  }
+  std::error_code error;
+  *exists = fs::exists(path, error);
+  if (error) {
+    return Status::IOError(
+        "inspect raft configuration file: " + error.message());
+  }
+  if (!*exists) {
+    return Status::OK();
+  }
+  std::string encoded;
+  Status status = ReadFile(path, &encoded);
+  if (!status.ok()) {
+    return status;
+  }
+  return DecodeConfiguration(encoded, configuration);
+}
+
 std::string SnapshotDirectoryName(
     uint64_t last_included_index, uint64_t last_included_term) {
   return "snapshot-" + std::to_string(last_included_index) +
@@ -353,8 +640,16 @@ struct RaftNode::Impl {
         status_last_applied(last_applied),
         status_snapshot(
             log->snapshot_marker().last_included_index) {
+    bootstrap_configuration_.index = 0;
+    bootstrap_configuration_.voters.insert(
+        options.peers.begin(), options.peers.end());
+    if (options.initially_voting) {
+      bootstrap_configuration_.voters.insert(options.node_id);
+    }
+    configuration_ = bootstrap_configuration_;
     election_random.seed(MakeElectionSeed(options));
     InstallHandlers();
+    PublishStatus();
   }
 
   Status Start();
@@ -377,9 +672,19 @@ struct RaftNode::Impl {
   Status ReplicateToPeer(uint32_t peer_id);
   Status AppendNoop();
   Status HandlePropose(const ProposeEvent& event);
+  Status HandleProposeConfChange(
+      const ProposeConfChangeEvent& event);
   Status AdvanceLeaderCommit();
   void ResetReplicationProgress();
   void FailPendingProposals(const Status& status);
+  void FailPendingConfChange(const Status& status);
+  Status ComputeConfigurationAt(
+      uint64_t target_index,
+      RaftConfiguration* configuration) const;
+  Status RebuildCurrentConfiguration();
+  void MarkConfigurationCommitted();
+  Status StepDownAfterSelfRemoval();
+  Status HasUncommittedConfChange(bool* pending) const;
   Status HandleReadIndex(const ReadIndexEvent& event);
   Status StartPendingReads();
   Status SendReadIndexHeartbeat(
@@ -432,6 +737,8 @@ struct RaftNode::Impl {
   bool HeartbeatDeadlineReached(Clock::time_point now) const;
   bool HasRecentLeader(Clock::time_point now) const;
   bool IsConfiguredPeer(uint32_t peer_id) const;
+  bool IsAcceptedLeader(uint32_t peer_id) const;
+  bool IsSelfVoter() const;
   bool HasMajority(
       const std::unordered_set<uint32_t>& votes) const;
   void ClearElectionVotes();
@@ -461,6 +768,11 @@ struct RaftNode::Impl {
     status_snapshot.store(
         log->snapshot_marker().last_included_index,
         std::memory_order_relaxed);
+    status_configuration_index.store(
+        configuration_.index, std::memory_order_relaxed);
+    auto voters = std::make_shared<const std::vector<uint32_t>>(
+        configuration_.voters.begin(), configuration_.voters.end());
+    std::atomic_store(&status_voters, std::move(voters));
   }
 
   RaftNodeOptions options;
@@ -490,6 +802,10 @@ struct RaftNode::Impl {
   Clock::time_point heartbeat_deadline{};
   std::unordered_set<uint32_t> pre_votes_received;
   std::unordered_set<uint32_t> votes_received;
+  RaftConfiguration bootstrap_configuration_;
+  RaftConfiguration configuration_;
+  std::set<uint32_t> transitional_voters_;
+  std::optional<uint64_t> uncommitted_conf_change_index_;
 
   std::atomic<Role> status_role;
   std::atomic<uint64_t> status_term;
@@ -499,6 +815,9 @@ struct RaftNode::Impl {
   std::atomic<uint64_t> status_last_log;
   std::atomic<uint64_t> status_last_applied;
   std::atomic<uint64_t> status_snapshot;
+  std::atomic<uint64_t> status_configuration_index{0};
+  std::shared_ptr<const std::vector<uint32_t>> status_voters =
+      std::make_shared<const std::vector<uint32_t>>();
 
   std::atomic<uint64_t> processed_events{0};
   std::atomic<uint64_t> tick_count{0};
@@ -527,9 +846,15 @@ struct RaftNode::Impl {
     bool started = false;
   };
 
+  struct PendingConfChange {
+    uint64_t index = 0;
+    ConfChangeCallback done;
+  };
+
   struct LocalSnapshot {
     uint64_t last_included_index = 0;
     uint64_t last_included_term = 0;
+    RaftConfiguration configuration;
     std::string directory;
     std::string bundle_path;
     uint64_t bundle_size = 0;
@@ -540,6 +865,7 @@ struct RaftNode::Impl {
     uint64_t last_included_index = 0;
     uint64_t last_included_term = 0;
     uint64_t next_offset = 0;
+    RaftConfiguration configuration;
     std::string bundle_path;
   };
 
@@ -548,6 +874,7 @@ struct RaftNode::Impl {
   std::map<uint64_t, PendingRead> pending_reads_;
   std::optional<LocalSnapshot> local_snapshot_;
   std::optional<IncomingSnapshot> incoming_snapshot_;
+  std::optional<PendingConfChange> pending_conf_change_;
   uint64_t next_append_sequence_ = 1;
   uint64_t next_read_ctx_id_ = 1;
   uint64_t next_snapshot_sequence_ = 1;
@@ -753,9 +1080,28 @@ Status RaftNode::Impl::RecoverSnapshotState() {
         return status;
       }
     }
+    RaftConfiguration snapshot_configuration;
+    bool configuration_exists = false;
+    status = ReadConfigurationFile(
+        JoinPath(directory, kConfigurationFileName),
+        &configuration_exists, &snapshot_configuration);
+    if (!status.ok()) {
+      return status;
+    }
+    if (!configuration_exists) {
+      snapshot_configuration = bootstrap_configuration_;
+      snapshot_configuration.index =
+          marker.last_included_index;
+    } else if (
+        snapshot_configuration.index !=
+        marker.last_included_index) {
+      return Status::Corruption(
+          "raft snapshot configuration index mismatch");
+    }
     local_snapshot_ = LocalSnapshot{
         marker.last_included_index,
         marker.last_included_term,
+        std::move(snapshot_configuration),
         directory,
         bundle_path,
         bundle_size};
@@ -823,6 +1169,12 @@ Status RaftNode::Impl::CreateLocalSnapshot() {
       JoinPath(temporary_directory, kSnapshotStateName);
   const std::string bundle_path =
       JoinPath(temporary_directory, kSnapshotBundleName);
+  RaftConfiguration snapshot_configuration;
+  status = ComputeConfigurationAt(
+      snapshot_index, &snapshot_configuration);
+  if (!status.ok()) {
+    return status;
+  }
 
   std::error_code error;
   fs::remove_all(temporary_directory, error);
@@ -840,6 +1192,13 @@ Status RaftNode::Impl::CreateLocalSnapshot() {
   // 先完成快照目录和 bundle，再推进 RaftLog 边界。
   status = state_machine->TakeSnapshot(
       snapshot_index, state_directory);
+  if (!status.ok()) {
+    cleanup();
+    return status;
+  }
+  status = WriteConfigurationFile(
+      JoinPath(temporary_directory, kConfigurationFileName),
+      snapshot_configuration);
   if (!status.ok()) {
     cleanup();
     return status;
@@ -878,6 +1237,7 @@ Status RaftNode::Impl::CreateLocalSnapshot() {
   local_snapshot_ = LocalSnapshot{
       snapshot_index,
       snapshot_term,
+      std::move(snapshot_configuration),
       final_directory,
       JoinPath(final_directory, kSnapshotBundleName),
       bundle_size};
@@ -954,10 +1314,167 @@ Status RaftNode::Impl::RemoveInstallMarker() {
   return SyncDirectory(snapshot_root);
 }
 
+Status RaftNode::Impl::ComputeConfigurationAt(
+    uint64_t target_index,
+    RaftConfiguration* configuration) const {
+  if (configuration == nullptr) {
+    return Status::InvalidArgument(
+        "raft configuration output is null");
+  }
+
+  RaftConfiguration computed = bootstrap_configuration_;
+  uint64_t scan_index = 1;
+  const uint64_t snapshot_index =
+      log->snapshot_marker().last_included_index;
+  if (local_snapshot_.has_value() &&
+      local_snapshot_->last_included_index <= target_index) {
+    computed = local_snapshot_->configuration;
+    scan_index = computed.index + 1;
+  } else if (snapshot_index != 0) {
+    // F4.8 之前的快照没有配置 sidecar，此时启动参数仍是有效配置。
+    computed.index = snapshot_index;
+    scan_index = snapshot_index + 1;
+  }
+
+  if (target_index < computed.index ||
+      target_index > log->LastIndex()) {
+    return Status::InvalidArgument(
+        "raft configuration target index is invalid");
+  }
+  for (uint64_t index = scan_index;
+       index <= target_index; ++index) {
+    proto::LogEntry entry;
+    Status status = log->EntryAt(index, &entry);
+    if (!status.ok()) {
+      return status;
+    }
+    if (entry.entry_type() == proto::ENTRY_TYPE_CONF_CHANGE) {
+      proto::ConfChange change;
+      status = DecodeConfChangePayload(entry.payload(), &change);
+      if (!status.ok()) {
+        return status;
+      }
+      status = ApplyConfChange(change, index, &computed);
+      if (!status.ok()) {
+        return Status::Corruption(status.message());
+      }
+    }
+    computed.index = index;
+    if (index == std::numeric_limits<uint64_t>::max()) {
+      break;
+    }
+  }
+  *configuration = std::move(computed);
+  return Status::OK();
+}
+
+Status RaftNode::Impl::RebuildCurrentConfiguration() {
+  // 配置按日志顺序重建，未提交变更额外保留旧成员以接收其收官请求。
+  RaftConfiguration rebuilt;
+  Status status =
+      ComputeConfigurationAt(log->LastIndex(), &rebuilt);
+  if (!status.ok()) {
+    return status;
+  }
+
+  std::optional<uint64_t> uncommitted_index;
+  for (uint64_t index = commit_index + 1;
+       index <= log->LastIndex(); ++index) {
+    proto::LogEntry entry;
+    status = log->EntryAt(index, &entry);
+    if (!status.ok()) {
+      return status;
+    }
+    if (entry.entry_type() != proto::ENTRY_TYPE_CONF_CHANGE) {
+      if (index == std::numeric_limits<uint64_t>::max()) {
+        break;
+      }
+      continue;
+    }
+    if (uncommitted_index.has_value()) {
+      return Status::Corruption(
+          "raft has multiple uncommitted configuration changes");
+    }
+    uncommitted_index = index;
+    if (index == std::numeric_limits<uint64_t>::max()) {
+      break;
+    }
+  }
+
+  std::set<uint32_t> transitional;
+  if (uncommitted_index.has_value()) {
+    RaftConfiguration previous;
+    status = ComputeConfigurationAt(
+        *uncommitted_index - 1, &previous);
+    if (!status.ok()) {
+      return status;
+    }
+    transitional = std::move(previous.voters);
+  }
+  configuration_ = std::move(rebuilt);
+  transitional_voters_ = std::move(transitional);
+  uncommitted_conf_change_index_ = uncommitted_index;
+  return Status::OK();
+}
+
+void RaftNode::Impl::MarkConfigurationCommitted() {
+  if (!uncommitted_conf_change_index_.has_value() ||
+      *uncommitted_conf_change_index_ > commit_index) {
+    return;
+  }
+  transitional_voters_.clear();
+  uncommitted_conf_change_index_.reset();
+}
+
+Status RaftNode::Impl::HasUncommittedConfChange(
+    bool* pending) const {
+  if (pending == nullptr) {
+    return Status::InvalidArgument(
+        "raft configuration pending output is null");
+  }
+  *pending = false;
+  for (uint64_t index = commit_index + 1;
+       index <= log->LastIndex(); ++index) {
+    proto::LogEntry entry;
+    Status status = log->EntryAt(index, &entry);
+    if (!status.ok()) {
+      return status;
+    }
+    if (entry.entry_type() == proto::ENTRY_TYPE_CONF_CHANGE) {
+      *pending = true;
+      return Status::OK();
+    }
+    if (index == std::numeric_limits<uint64_t>::max()) {
+      break;
+    }
+  }
+  return Status::OK();
+}
+
+Status RaftNode::Impl::StepDownAfterSelfRemoval() {
+  // 移除自身的配置已提交，本节点立即停止 Leader 职责。
+  const bool was_leader = role == Role::kLeader;
+  role = Role::kFollower;
+  leader_id = 0;
+  replication_.clear();
+  if (was_leader) {
+    FailPendingProposals(
+        Status::NotLeader("raft leader was removed"));
+  }
+  FailPendingReads(
+      Status::NotLeader("raft leader was removed"));
+  ResetElectionDeadline(Clock::now());
+  PublishStatus();
+  return Status::OK();
+}
+
 void RaftNode::Impl::ResetReplicationProgress() {
   replication_.clear();
   const uint64_t next_index = log->LastIndex() + 1;
-  for (uint32_t peer_id : options.peers) {
+  for (uint32_t peer_id : configuration_.voters) {
+    if (peer_id == options.node_id) {
+      continue;
+    }
     replication_[peer_id].next_index = next_index;
   }
 }
@@ -1018,7 +1535,10 @@ Status RaftNode::Impl::HandlePropose(const ProposeEvent& event) {
     pending_proposals_[index] = event.done;
   }
   PublishStatus();
-  for (uint32_t peer_id : options.peers) {
+  for (uint32_t peer_id : configuration_.voters) {
+    if (peer_id == options.node_id) {
+      continue;
+    }
     status = ReplicateToPeer(peer_id);
     if (!status.ok()) {
       return status;
@@ -1036,6 +1556,121 @@ void RaftNode::Impl::FailPendingProposals(const Status& status) {
       entry.second(status);
     }
   }
+}
+
+void RaftNode::Impl::FailPendingConfChange(
+    const Status& status) {
+  if (!pending_conf_change_.has_value()) {
+    return;
+  }
+  ConfChangeCallback done =
+      std::move(pending_conf_change_->done);
+  pending_conf_change_.reset();
+  if (done != nullptr) {
+    done(status);
+  }
+}
+
+Status RaftNode::Impl::HandleProposeConfChange(
+    const ProposeConfChangeEvent& event) {
+  if (role != Role::kLeader) {
+    if (event.done != nullptr) {
+      event.done(Status::NotLeader("raft node is not leader"));
+    }
+    return Status::OK();
+  }
+  if (log->LastIndex() >=
+      std::numeric_limits<uint64_t>::max() - 1) {
+    const Status status =
+        Status::Corruption("raft log index is exhausted");
+    if (event.done != nullptr) {
+      event.done(status);
+    }
+    return status;
+  }
+
+  Status status = ValidateConfChange(event.change);
+  if (!status.ok()) {
+    if (event.done != nullptr) {
+      event.done(status);
+    }
+    return Status::OK();
+  }
+  RaftConfiguration updated = configuration_;
+  const uint64_t index = log->LastIndex() + 1;
+  status = ApplyConfChange(event.change, index, &updated);
+  if (!status.ok()) {
+    if (event.done != nullptr) {
+      event.done(status);
+    }
+    return Status::OK();
+  }
+
+  bool has_uncommitted = false;
+  status = HasUncommittedConfChange(&has_uncommitted);
+  if (!status.ok()) {
+    return status;
+  }
+  if (has_uncommitted || pending_conf_change_.has_value()) {
+    if (event.done != nullptr) {
+      event.done(Status::InvalidArgument(
+          "raft already has an uncommitted configuration change"));
+    }
+    return Status::OK();
+  }
+
+  std::string payload;
+  status = EncodeConfChangePayload(event.change, &payload);
+  if (!status.ok()) {
+    if (event.done != nullptr) {
+      event.done(status);
+    }
+    return Status::OK();
+  }
+
+  proto::LogEntry entry;
+  entry.set_term(current_term);
+  entry.set_index(index);
+  entry.set_entry_type(proto::ENTRY_TYPE_CONF_CHANGE);
+  entry.set_payload(std::move(payload));
+  std::vector<proto::LogEntry> entries;
+  entries.push_back(std::move(entry));
+  status = log->Append(std::move(entries));
+  if (!status.ok()) {
+    if (event.done != nullptr) {
+      event.done(status);
+    }
+    return status;
+  }
+
+  // 配置日志落盘后立即切换到新成员集合。
+  const std::set<uint32_t> previous_voters =
+      configuration_.voters;
+  configuration_ = std::move(updated);
+  transitional_voters_ = previous_voters;
+  uncommitted_conf_change_index_ = index;
+  pending_conf_change_ =
+      PendingConfChange{index, event.done};
+
+  if (event.change.type() == proto::CONF_CHANGE_ADD_NODE) {
+    PeerReplicationState& added =
+        replication_[event.change.node_id()];
+    added = PeerReplicationState();
+    added.next_index = 1;
+  } else {
+    replication_.erase(event.change.node_id());
+  }
+  PublishStatus();
+  for (uint32_t peer_id : configuration_.voters) {
+    if (peer_id == options.node_id) {
+      continue;
+    }
+    status = ReplicateToPeer(peer_id);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return AdvanceLeaderCommit();
 }
 
 Status RaftNode::Impl::HasCommittedEntryInCurrentTerm(
@@ -1140,7 +1775,10 @@ Status RaftNode::Impl::SendReadIndexHeartbeat(
 
   const uint64_t prev_log_index = request.prev_log_index();
   const std::weak_ptr<ActorEventSink> weak_sink = event_sink;
-  for (uint32_t peer_id : options.peers) {
+  for (uint32_t peer_id : configuration_.voters) {
+    if (peer_id == options.node_id) {
+      continue;
+    }
     transport->SendAppendEntries(
         peer_id, request,
         [weak_sink, peer_id, prev_log_index](
@@ -1246,6 +1884,14 @@ Status RaftNode::Impl::ApplyCommitted() {
       if (!status.ok()) {
         return status;
       }
+    } else if (
+        entry.entry_type() == proto::ENTRY_TYPE_CONF_CHANGE) {
+      proto::ConfChange change;
+      status =
+          DecodeConfChangePayload(entry.payload(), &change);
+      if (!status.ok()) {
+        return status;
+      }
     }
     last_applied = index;
     status_last_applied.store(
@@ -1260,11 +1906,28 @@ Status RaftNode::Impl::ApplyCommitted() {
         done(Status::OK());
       }
     }
+    if (entry.entry_type() == proto::ENTRY_TYPE_CONF_CHANGE &&
+        pending_conf_change_.has_value() &&
+        pending_conf_change_->index == index) {
+      ConfChangeCallback done =
+          std::move(pending_conf_change_->done);
+      pending_conf_change_.reset();
+      if (role == Role::kLeader && !IsSelfVoter()) {
+        status = StepDownAfterSelfRemoval();
+        if (!status.ok()) {
+          return status;
+        }
+      }
+      if (done != nullptr) {
+        done(Status::OK());
+      }
+    }
     Status snapshot_status = MaybeCreateSnapshot();
     if (!snapshot_status.ok()) {
       return snapshot_status;
     }
   }
+  MarkConfigurationCommitted();
   return Status::OK();
 }
 
@@ -1282,6 +1945,7 @@ Status RaftNode::Impl::AdvanceCommitIndex(uint64_t candidate_index) {
   if (!status.ok()) {
     return status;
   }
+  MarkConfigurationCommitted();
   return StartPendingReads();
 }
 
@@ -1291,9 +1955,14 @@ Status RaftNode::Impl::AdvanceLeaderCommit() {
   }
 
   std::vector<uint64_t> matched_indices;
-  matched_indices.reserve(options.peers.size() + 1);
-  matched_indices.push_back(log->LastIndex());
-  for (uint32_t peer_id : options.peers) {
+  matched_indices.reserve(configuration_.voters.size());
+  if (IsSelfVoter()) {
+    matched_indices.push_back(log->LastIndex());
+  }
+  for (uint32_t peer_id : configuration_.voters) {
+    if (peer_id == options.node_id) {
+      continue;
+    }
     const auto replication = replication_.find(peer_id);
     matched_indices.push_back(
         replication == replication_.end()
@@ -1341,6 +2010,15 @@ Status RaftNode::Impl::ValidateAppendEntries(
         entry.term() < previous_term) {
       return Status::InvalidArgument(
           "append entries payload is invalid");
+    }
+    if (entry.entry_type() ==
+        proto::ENTRY_TYPE_CONF_CHANGE) {
+      proto::ConfChange change;
+      Status status =
+          DecodeConfChangePayload(entry.payload(), &change);
+      if (!status.ok()) {
+        return status;
+      }
     }
     previous_term = entry.term();
     if (expected_index ==
@@ -1505,15 +2183,29 @@ Status RaftNode::Impl::RetryPeerAfterConflict(
 }
 
 bool RaftNode::Impl::IsConfiguredPeer(uint32_t peer_id) const {
-  return std::find(
-             options.peers.begin(), options.peers.end(), peer_id) !=
-         options.peers.end();
+  return peer_id != options.node_id &&
+         configuration_.voters.count(peer_id) != 0;
+}
+
+bool RaftNode::Impl::IsAcceptedLeader(uint32_t peer_id) const {
+  return peer_id != options.node_id &&
+         (configuration_.voters.count(peer_id) != 0 ||
+          transitional_voters_.count(peer_id) != 0);
+}
+
+bool RaftNode::Impl::IsSelfVoter() const {
+  return configuration_.voters.count(options.node_id) != 0;
 }
 
 bool RaftNode::Impl::HasMajority(
     const std::unordered_set<uint32_t>& votes) const {
-  const size_t cluster_size = options.peers.size() + 1;
-  return votes.size() >= cluster_size / 2 + 1;
+  size_t voter_acks = 0;
+  for (uint32_t voter : configuration_.voters) {
+    if (votes.count(voter) != 0) {
+      ++voter_acks;
+    }
+  }
+  return voter_acks >= configuration_.voters.size() / 2 + 1;
 }
 
 void RaftNode::Impl::ClearElectionVotes() {
@@ -1530,6 +2222,9 @@ Status RaftNode::Impl::OnTick(Clock::time_point now) {
     ResetHeartbeatDeadline(now);
     return BroadcastHeartbeat();
   }
+  if (!IsSelfVoter()) {
+    return Status::OK();
+  }
   if (!ElectionDeadlineReached(now)) {
     return Status::OK();
   }
@@ -1537,10 +2232,15 @@ Status RaftNode::Impl::OnTick(Clock::time_point now) {
 }
 
 Status RaftNode::Impl::StartPreVote(Clock::time_point now) {
+  if (!IsSelfVoter()) {
+    return Status::OK();
+  }
   if (current_term == std::numeric_limits<uint64_t>::max()) {
     return Status::Corruption("raft term is exhausted");
   }
   FailPendingProposals(
+      Status::NotLeader("raft leader stepped down"));
+  FailPendingConfChange(
       Status::NotLeader("raft leader stepped down"));
   FailPendingReads(
       Status::NotLeader("raft leader stepped down"));
@@ -1557,10 +2257,15 @@ Status RaftNode::Impl::StartPreVote(Clock::time_point now) {
 }
 
 Status RaftNode::Impl::BecomeCandidate(Clock::time_point now) {
+  if (!IsSelfVoter()) {
+    return Status::OK();
+  }
   if (current_term == std::numeric_limits<uint64_t>::max()) {
     return Status::Corruption("raft term is exhausted");
   }
   FailPendingProposals(
+      Status::NotLeader("raft leader stepped down"));
+  FailPendingConfChange(
       Status::NotLeader("raft leader stepped down"));
   FailPendingReads(
       Status::NotLeader("raft leader stepped down"));
@@ -1617,6 +2322,8 @@ Status RaftNode::Impl::ObserveHigherTerm(
   if (was_leader) {
     FailPendingProposals(
         Status::NotLeader("raft leader stepped down"));
+    FailPendingConfChange(
+        Status::NotLeader("raft leader stepped down"));
   }
   FailPendingReads(
       Status::NotLeader("raft leader stepped down"));
@@ -1641,7 +2348,10 @@ Status RaftNode::Impl::BroadcastVoteRequests(bool is_pre_vote) {
   request.set_is_pre_vote(is_pre_vote);
 
   const std::weak_ptr<ActorEventSink> weak_sink = event_sink;
-  for (uint32_t peer_id : options.peers) {
+  for (uint32_t peer_id : configuration_.voters) {
+    if (peer_id == options.node_id) {
+      continue;
+    }
     transport->SendRequestVote(
         peer_id, request,
         [weak_sink, peer_id, is_pre_vote](
@@ -1807,6 +2517,9 @@ Status RaftNode::Impl::SendInstallSnapshotChunk(
       local_snapshot_->last_included_term);
   request.set_offset(offset);
   request.set_data(std::move(data));
+  for (uint32_t voter : local_snapshot_->configuration.voters) {
+    request.add_voters(voter);
+  }
   const bool done = offset + data_size == local_snapshot_->bundle_size;
   request.set_done(done);
 
@@ -1875,6 +2588,13 @@ Status RaftNode::Impl::InstallIncomingSnapshot() {
     fs::remove_all(temporary_directory, error);
     return status;
   }
+  status = WriteConfigurationFile(
+      JoinPath(temporary_directory, kConfigurationFileName),
+      incoming_snapshot_->configuration);
+  if (!status.ok()) {
+    fs::remove_all(temporary_directory, error);
+    return status;
+  }
   const std::string temporary_bundle =
       JoinPath(temporary_directory, kSnapshotBundleName);
   fs::rename(incoming_bundle, temporary_bundle, error);
@@ -1914,9 +2634,13 @@ Status RaftNode::Impl::InstallIncomingSnapshot() {
   }
   commit_index = snapshot_index;
   last_applied = snapshot_index;
+  configuration_ = incoming_snapshot_->configuration;
+  transitional_voters_.clear();
+  uncommitted_conf_change_index_.reset();
   local_snapshot_ = LocalSnapshot{
       snapshot_index,
       snapshot_term,
+      incoming_snapshot_->configuration,
       final_directory,
       JoinPath(final_directory, kSnapshotBundleName),
       bundle_size};
@@ -1973,7 +2697,10 @@ Status RaftNode::Impl::BroadcastHeartbeat() {
   request.set_leader_commit(commit_index);
   const uint64_t prev_log_index = request.prev_log_index();
   const std::weak_ptr<ActorEventSink> weak_sink = event_sink;
-  for (uint32_t peer_id : options.peers) {
+  for (uint32_t peer_id : configuration_.voters) {
+    if (peer_id == options.node_id) {
+      continue;
+    }
     const auto replication = replication_.find(peer_id);
     if (replication == replication_.end() ||
         replication->second.inflight_kind ==
@@ -2015,6 +2742,7 @@ Status RaftNode::Impl::OnRequestVoteRequest(
   if (event.request.term() == 0 ||
       event.request.candidate_id() == 0 ||
       event.request.candidate_id() != event.from_peer_id ||
+      !IsSelfVoter() ||
       !IsConfiguredPeer(event.request.candidate_id()) ||
       event.request.last_log_term() > event.request.term() ||
       (event.request.last_log_term() == 0 &&
@@ -2108,7 +2836,7 @@ Status RaftNode::Impl::OnAppendEntriesRequest(
   if (event.request.term() == 0 ||
       event.request.leader_id() == 0 ||
       event.request.leader_id() != event.from_peer_id ||
-      !IsConfiguredPeer(event.request.leader_id())) {
+      !IsAcceptedLeader(event.request.leader_id())) {
     complete(Status::OK(), false);
     PublishStatus();
     return Status::OK();
@@ -2174,6 +2902,14 @@ Status RaftNode::Impl::OnAppendEntriesRequest(
     complete(status, false);
     return status;
   }
+  if (event.request.entries_size() > 0) {
+    status = RebuildCurrentConfiguration();
+    if (!status.ok()) {
+      complete(status, false);
+      return status;
+    }
+    PublishStatus();
+  }
 
   const uint64_t follower_commit =
       std::min(event.request.leader_commit(), matched_index);
@@ -2202,7 +2938,7 @@ Status RaftNode::Impl::OnInstallSnapshotRequest(
   if (event.request.term() == 0 ||
       event.request.leader_id() == 0 ||
       event.request.leader_id() != event.from_peer_id ||
-      !IsConfiguredPeer(event.request.leader_id()) ||
+      !IsAcceptedLeader(event.request.leader_id()) ||
       event.request.last_included_index() == 0 ||
       event.request.last_included_index() ==
           std::numeric_limits<uint64_t>::max() ||
@@ -2241,8 +2977,33 @@ Status RaftNode::Impl::OnInstallSnapshotRequest(
       event.request.last_included_index();
   const uint64_t snapshot_term =
       event.request.last_included_term();
+  RaftConfiguration request_configuration;
+  request_configuration.index = snapshot_index;
+  for (int index = 0;
+       index < event.request.voters_size(); ++index) {
+    const uint32_t voter = event.request.voters(index);
+    if (voter == 0 ||
+        (!request_configuration.voters.empty() &&
+         voter <= *request_configuration.voters.rbegin())) {
+      complete(Status::OK(), false);
+      return Status::OK();
+    }
+    request_configuration.voters.insert(voter);
+  }
+  if (request_configuration.voters.empty() ||
+      request_configuration.voters.count(
+          event.request.leader_id()) == 0) {
+    complete(Status::OK(), false);
+    return Status::OK();
+  }
   if (snapshot_index == log->snapshot_marker().last_included_index &&
       snapshot_term == log->snapshot_marker().last_included_term) {
+    if (local_snapshot_.has_value() &&
+        local_snapshot_->configuration.voters !=
+            request_configuration.voters) {
+      complete(Status::OK(), false);
+      return Status::OK();
+    }
     if (event.request.offset() >
         std::numeric_limits<uint64_t>::max() -
             event.request.data().size()) {
@@ -2286,12 +3047,14 @@ Status RaftNode::Impl::OnInstallSnapshotRequest(
     }
     incoming_snapshot_ = IncomingSnapshot{
         event.request.leader_id(), snapshot_index, snapshot_term, 0,
-        bundle_path};
+        request_configuration, bundle_path};
   }
   if (!incoming_snapshot_.has_value() ||
       incoming_snapshot_->leader_id != event.request.leader_id() ||
       incoming_snapshot_->last_included_index != snapshot_index ||
-      incoming_snapshot_->last_included_term != snapshot_term) {
+      incoming_snapshot_->last_included_term != snapshot_term ||
+      incoming_snapshot_->configuration.voters !=
+          request_configuration.voters) {
     complete(Status::OK(), false);
     return Status::OK();
   }
@@ -2436,7 +3199,17 @@ Status RaftNode::Impl::OnAppendEntriesResponse(
     if (!status.ok()) {
       return status;
     }
-    if (replication->second.next_index <= log->LastIndex()) {
+    // 配置提交可能移除本 Leader，不能继续使用旧复制迭代器。
+    if (role != Role::kLeader || !IsConfiguredPeer(event.peer_id)) {
+      return Status::OK();
+    }
+    const auto current_replication =
+        replication_.find(event.peer_id);
+    if (current_replication == replication_.end()) {
+      return Status::OK();
+    }
+    if (current_replication->second.next_index <=
+        log->LastIndex()) {
       return ReplicateToPeer(event.peer_id);
     }
     return Status::OK();
@@ -2606,6 +3379,13 @@ RaftNodeStatus RaftNode::Impl::GetStatus() const {
       status_last_applied.load(std::memory_order_relaxed);
   status.snapshot_index =
       status_snapshot.load(std::memory_order_relaxed);
+  status.configuration_index =
+      status_configuration_index.load(std::memory_order_relaxed);
+  const std::shared_ptr<const std::vector<uint32_t>> voters =
+      std::atomic_load(&status_voters);
+  if (voters != nullptr) {
+    status.voters = *voters;
+  }
   status.processed_events =
       processed_events.load(std::memory_order_relaxed);
   status.tick_count =
@@ -2650,6 +3430,10 @@ Status RaftNode::Impl::Step(const RaftEvent& event) {
   }
   if (const auto* proposal = std::get_if<ProposeEvent>(&event)) {
     return HandlePropose(*proposal);
+  }
+  if (const auto* proposal =
+          std::get_if<ProposeConfChangeEvent>(&event)) {
+    return HandleProposeConfChange(*proposal);
   }
   if (const auto* read = std::get_if<ReadIndexEvent>(&event)) {
     return HandleReadIndex(*read);
@@ -2737,6 +3521,8 @@ void RaftNode::Impl::Run() {
 
   FailPendingProposals(
       Status::NotLeader("raft actor stopped"));
+  FailPendingConfChange(
+      Status::Timeout("raft actor stopped"));
   FailPendingReads(
       Status::Timeout("raft actor stopped"));
   event_sink->Close();
@@ -2820,6 +3606,10 @@ Status RaftNode::Create(
           "raft peer list is invalid");
     }
   }
+  if (!options.initially_voting && peers.empty()) {
+    return Status::InvalidArgument(
+        "raft non-voting node requires known peers");
+  }
 
   auto impl = std::make_unique<Impl>(
       std::move(options), std::move(transport), std::move(log),
@@ -2828,6 +3618,11 @@ Status RaftNode::Create(
   if (!status.ok()) {
     return status;
   }
+  status = impl->RebuildCurrentConfiguration();
+  if (!status.ok()) {
+    return status;
+  }
+  impl->PublishStatus();
   *node = std::unique_ptr<RaftNode>(
       new RaftNode(std::move(impl)));
   return Status::OK();

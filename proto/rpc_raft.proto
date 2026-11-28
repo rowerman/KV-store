@@ -8,6 +8,17 @@ enum EntryType {
   ENTRY_TYPE_NO_OP = 2;
 }
 
+enum ConfChangeType {
+  CONF_CHANGE_ADD_NODE = 0;
+  CONF_CHANGE_REMOVE_NODE = 1;
+}
+
+// 单步成员变更；payload 使用该消息的 protobuf 编码。
+message ConfChange {
+  ConfChangeType type = 1;
+  uint32 node_id = 2;
+}
+
 // Raft 日志条目；payload 由 entry_type 决定解释方式。
 message LogEntry {
   uint64 term = 1;
@@ -63,6 +74,8 @@ message InstallSnapshotRequest {
   bytes data = 6;
   // 最后一块必须置为 true。
   bool done = 7;
+  // 快照 last_included_index 对应的投票成员，按节点 ID 升序排列。
+  repeated uint32 voters = 8;
 }
 
 // 快照分块接收结果。

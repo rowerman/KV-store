@@ -55,7 +55,8 @@
 
 - `RaftNode` 使用一个 `std::thread` 驱动 `MpscQueue<RaftEvent>`；网络、存储和上层
   调用只能投递事件，不能直接修改 Raft 核心字段。
-- `RaftEvent` 覆盖 Tick、三类 RPC 请求/响应、Propose、ReadIndex 和 Stop。
+- `RaftEvent` 覆盖 Tick、三类 RPC 请求/响应、普通提案、成员变更提案、
+  ReadIndex 和 Stop。
 - 生命周期为 Created、Running、Stopping、Stopped；Start 幂等，Stop 后不支持重启。
 - 外部 Stop 通过 join 等待 Actor 退出；Actor 线程内 Stop 只投递停止事件，不 join
   自身。
@@ -112,5 +113,22 @@
   事务，依次执行 `LoadSnapshot`、`ResetToSnapshot` 和 commit/apply 镜像更新。
 - 启动时若发现 `INSTALLING`，会重复幂等加载快照并重置 RaftLog；半成品 incoming
   数据和未关联完整目录会被清理。
-- F4.8 单步成员变更尚未实现。
+- `ENTRY_TYPE_CONF_CHANGE` 的 payload 使用 protobuf `ConfChange`，只允许单节点
+  AddNode 或 RemoveNode。Leader 拒绝第二条 `(commit_index, LastIndex()]` 内的
+  配置日志，也拒绝移除最后一个投票节点。
+- 配置日志落盘后立即切换 voters，多数派、投票广播、日志复制、ReadIndex 心跳和
+  Leader 提交计算都只使用当前配置。配置提交并 Apply 后才完成上层回调。
+- AddNode 为新节点从 index 1 开始补日志，日志前缀已被压缩时先发送快照；
+  RemoveNode 立即删除对应复制进度。被移除 Leader 使用新配置完成提交后退位。
+- Follower 在接收配置日志后重建 voters；后缀被覆盖时重新扫描快照之后的日志并
+  恢复配置。未提交的移除自身变更会保留旧 voters 作为过渡，允许原 Leader 完成
+  提交后的收官请求。
+- 本地快照目录通过 `raft_conf.bin` 保存快照 index 对应的 voters；
+  `InstallSnapshotRequest.voters` 在分块间必须一致且包含发送 Leader。启动安装
+  事务时同时恢复状态机、RaftLog 边界和投票配置。
+- `initially_voting=false` 用于加入节点启动预热：节点以 `peers` 作为当前 voters，
+  可接收现有 Leader 请求，但快照或配置日志将自身加入前不发起选举。
+- `RaftNodeStatus` 以原子共享只读快照发布 `configuration_index` 和 `voters`，
+  供 Server 与测试观察当前配置。
+- 当前成员变更不实现 Joint Consensus、批量变更或永久 Learner 数据预复制。
 

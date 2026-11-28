@@ -325,13 +325,17 @@ sudo apt install -y \
 - **测试验收**：关闭 1 个 Follower，向集群写入足够触发 2 次快照的日志，再重新拉起该 Follower，验证其通过快照追平并正确包含最新数据。
 - **实现补充**：完成目录快照、确定性 bundle、CRC 与路径校验、RaftLog 快照边界重置、阈值触发压缩、分块发送和 offset 回包关联、Follower 完整接收后 LoadSnapshot，以及 `INSTALLING` 崩溃恢复事务。新增 10 个快照相关测试，Debug、ASan/UBSan、TSan 均 45/45 通过，两套快照测试 TSan 连续 10 轮通过。
 
-### [ ] F4.8 单步成员变更（Single-Server Change）
+### [x] F4.8 单步成员变更（Single-Server Change）
 
 - **目标**：支持在线安全扩容（如 3 节点扩到 5 节点）或下线故障节点。
 - **必写逻辑**：
   - 定义 `ConfChange` 特殊日志类型（`AddNode` / `RemoveNode`）。
   - 每次只允许集群中存在 1 条未提交的 `ConfChange` 日志，收到新变更立即应用到路由配置；若被移除的是 Leader 自己，在该日志提交后主动退位。
 - **测试验收**：3 节点集群动态新增第 4、第 5 个空节点，验证新节点通过快照同步数据并正常参与后续选主。
+- **实现补充**：完成 `ConfChange` protobuf 日志、配置立即生效、单条未提交限制、
+  AddNode/RemoveNode、动态复制与多数派、Follower 后缀重建、Leader 提交后退位，
+  以及快照 `raft_conf.bin` 和 InstallSnapshot voters 恢复。新增 7 个成员变更测试，
+  Debug、ASan/UBSan、TSan 均 52/52 通过，TSan 成员变更 7 项连续重复 10 轮通过。
 
 ---
 
