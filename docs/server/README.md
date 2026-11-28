@@ -70,3 +70,43 @@ Leader 路由提示、幂等去重及节点生命周期管理。
 - EventLoop 必须在 RpcClient 完成断开前存活；RpcServer 应在 Transport 销毁前停止，
   避免继续分发新的内部 Raft 请求。
 
+## KVServer 全链路
+
+- `KVServer` 独占 RpcServer、LSMTree 和 RaftNode，借用调用方创建的 EventLoop。
+  RaftNode 和 KVStateMachine 必须先于 LSMTree 销毁。
+- 客户端 RPC 固定为 Put 201、Delete 202、Get 203、Scan 204。
+- 写请求在 RPC IO 线程完成解码和 client_id/seq_num 校验，编码为 KvCommand 后投递
+  ProposeEvent。只有日志提交并 Apply 后才返回业务成功。
+- 重复写使用相同 client_id/seq_num 会重复形成日志，但 SessionTable 会跳过第二次
+  存储写入，因此客户端超时重试不会覆盖第一次结果。
+- `Get(linearizable=true)` 和全部 Scan 先投递 ReadIndexEvent。确认多数派且
+  last_applied 追平后，ReadIndex 回调把 LSM 查询投递回 EventLoop，避免阻塞 Raft
+  Actor。
+- `Get(linearizable=false)` 在 RPC IO 线程直接读取本地 LSM，可能读到 Follower 的
+  旧状态。
+- Scan 使用半开区间 `[start_key, end_key)`；limit 必须为 1-10000，通过读取
+  limit+1 条计算 has_more。
+- 业务结果始终通过正常 RPC 响应中的 StatusCode 返回；只有请求 Protobuf 损坏时
+  才使用帧级 InvalidArgument。
+- NotLeader 响应根据 RaftNodeStatus.leader_id 填写 `leader_hint=host:port`；未知
+  Leader 或地址未配置时留空。
+- Create 按 LSM、KVStateMachine、RaftLog、RpcServer、RealRaftTransport、RaftNode
+  顺序组装。Start 先启动 RpcServer，再启动 RaftNode；Stop 先停 RaftNode，再停
+  RpcServer。
+- Stop 不持生命周期锁等待 Raft Actor，使用 stopping/stopped 和条件变量支持并发、
+  重复调用。
+- RpcServer 的四类客户端 Handler 捕获 Impl 弱引用，KVServer 销毁后不会访问悬空
+  状态。
+
+## 服务端主程序
+
+- 可执行目标为 `raftkv_server`，静态库目标为 `raftkv_server_lib`。
+- 必填参数：`--id`、`--addr`、`--peers`、`--data-dir`。
+- 可选参数：`--listen-ip`、`--rpc-io-threads`、`--help`。
+- `--peers` 必须包含本节点；命令行中本地 ID 对应的 Host/Port 可由 `--addr` 覆盖，
+  其余节点作为远程 Raft Peers。
+- 进程在创建 Raft/LSM 线程前阻塞 SIGINT/SIGTERM。独立线程通过 sigwait 接收信号并
+  Quit EventLoop，随后先停 Raft、再停 RPC 服务并恢复信号掩码。
+- 修改启动顺序时，必须保持 EventLoop、RpcServer、RaftNode 和 LSMTree 的生命周期
+  约束；不得在网络线程直接修改 Raft 状态或写 LSM。
+

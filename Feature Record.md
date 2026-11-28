@@ -368,7 +368,7 @@ sudo apt install -y \
   Impl 弱引用，Transport 销毁后不会悬空；Stop 可完成挂起调用。新增 6 个真实回环
   TCP 用例，Debug、ASan/UBSan、TSan 均 6/6 通过，TSan 每项重复 10 轮通过。
 
-### [ ] F5.3 `KVServer` 与服务端主程序 `raftkv_server`
+### [x] F5.3 `KVServer` 与服务端主程序 `raftkv_server`
 
 - **目标**：组装所有组件，编译出可独立运行的后端服务可执行文件。
 - **文件位置**：`include/raftkv/server/kv_server.h`、`src/server/main.cc`
@@ -379,6 +379,11 @@ sudo apt install -y \
   4. 初始化 `RealRaftTransport` 与 `RaftNode`（加载 `raft_wal`）。
   5. 初始化 `RpcServer`，注册客户端 KV RPC（Put/Get/Delete/Scan）与内部 Raft RPC。
   6. 启动 `RaftNode::Start()` 与 `RpcServer::Start()`，注册 `SIGINT / SIGTERM` 信号实现优雅关闭。
+- **实现补充**：新增 KVServer 全链路组装、客户端 RPC 201-204、Raft Propose 写路径、
+  ReadIndex 线性一致读、Leader Hint 和命令行主程序。可执行目标固定为
+  `raftkv_server`。SIGINT/SIGTERM 在任何业务线程创建前阻塞，由 sigwait 线程统一
+  触发退出。新增单节点生命周期和三节点真实 TCP 集成测试，Debug、ASan/UBSan、
+  TSan 均 2/2 通过，TSan 每项连续重复 10 轮通过。
 
 ### [ ] F5.4 `KVClient` SDK 与交互式命令行工具 `raftkv_cli`
 

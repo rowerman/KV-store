@@ -136,16 +136,24 @@ target_link_libraries(raftkv_raft PUBLIC
   raftkv_proto
 )
 
-add_library(raftkv_server STATIC
+add_library(raftkv_server_lib STATIC
+  src/server/kv_server.cc
   src/server/kv_state_machine.cc
   src/server/real_raft_transport.cc
   src/server/session_table.cc
 )
-target_link_libraries(raftkv_server PUBLIC
+target_link_libraries(raftkv_server_lib PUBLIC
   raftkv_raft
   raftkv_rpc
   raftkv_storage
   raftkv_proto
+)
+
+add_executable(raftkv_server
+  src/server/main.cc
+)
+target_link_libraries(raftkv_server PRIVATE
+  raftkv_server_lib
 )
 
 add_library(raftkv_rpc STATIC
@@ -240,19 +248,25 @@ target_link_libraries(rpc_test PRIVATE
 
 add_executable(session_table_test tests/session_table_test.cc)
 target_link_libraries(session_table_test PRIVATE
-  raftkv_server
+  raftkv_server_lib
   GTest::gtest_main
 )
 
 add_executable(kv_state_machine_test tests/kv_state_machine_test.cc)
 target_link_libraries(kv_state_machine_test PRIVATE
-  raftkv_server
+  raftkv_server_lib
   GTest::gtest_main
 )
 
 add_executable(real_raft_transport_test tests/real_raft_transport_test.cc)
 target_link_libraries(real_raft_transport_test PRIVATE
-  raftkv_server
+  raftkv_server_lib
+  GTest::gtest_main
+)
+
+add_executable(kv_server_test tests/kv_server_test.cc)
+target_link_libraries(kv_server_test PRIVATE
+  raftkv_server_lib
   GTest::gtest_main
 )
 
@@ -422,6 +436,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET real_raft_transport_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET kv_server_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
   set_property(TARGET memtable_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
@@ -489,6 +506,7 @@ gtest_discover_tests(rpc_test)
 gtest_discover_tests(session_table_test)
 gtest_discover_tests(kv_state_machine_test)
 gtest_discover_tests(real_raft_transport_test)
+gtest_discover_tests(kv_server_test)
 gtest_discover_tests(memtable_test)
 gtest_discover_tests(wal_test)
 gtest_discover_tests(bloom_lru_test)
