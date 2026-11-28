@@ -114,6 +114,15 @@ class RecordingStateMachine final : public StateMachine {
     return Status::OK();
   }
 
+  Status TakeSnapshot(
+      uint64_t, const std::string&) override {
+    return Status::OK();
+  }
+
+  Status LoadSnapshot(const std::string&) override {
+    return Status::OK();
+  }
+
  private:
   std::shared_ptr<ApplyRecorder> recorder_;
 };

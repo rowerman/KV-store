@@ -1498,6 +1498,60 @@ Status RaftLog::CompactPrefix(uint64_t up_to_index,
   return Status::OK();
 }
 
+Status RaftLog::ResetToSnapshot(
+    uint64_t last_included_index,
+    uint64_t last_included_term) {
+  if (impl_->unusable) {
+    return Status::IOError("raft log is unusable; reopen required");
+  }
+  if (last_included_index ==
+          impl_->snapshot_marker.last_included_index &&
+      last_included_term ==
+          impl_->snapshot_marker.last_included_term) {
+    return Status::OK();
+  }
+  if (last_included_index == 0 ||
+      last_included_index ==
+          std::numeric_limits<uint64_t>::max() ||
+      last_included_index <=
+          impl_->snapshot_marker.last_included_index ||
+      last_included_term == 0 ||
+      last_included_term > impl_->hard_state.current_term) {
+    return Status::InvalidArgument(
+        "invalid remote raft snapshot marker");
+  }
+
+  Status status = impl_->CloseActive();
+  if (!status.ok()) {
+    impl_->unusable = true;
+    return status;
+  }
+  for (const SegmentFile& segment : impl_->segments) {
+    if (::unlink(segment.path.c_str()) < 0 && errno != ENOENT) {
+      impl_->unusable = true;
+      return MakeIoError("remove raft log before snapshot reset");
+    }
+  }
+  status = SyncDirectory(impl_->directory);
+  if (!status.ok()) {
+    impl_->unusable = true;
+    return status;
+  }
+
+  const RaftSnapshotMarker marker{
+      last_included_index, last_included_term};
+  status = PersistMetadata(
+      impl_->directory, impl_->hard_state, marker);
+  if (!status.ok()) {
+    impl_->unusable = true;
+    return status;
+  }
+  impl_->segments.clear();
+  impl_->entries.clear();
+  impl_->snapshot_marker = marker;
+  return Status::OK();
+}
+
 Status RaftLog::SaveHardState(
     uint64_t current_term,
     std::optional<uint32_t> voted_for) {

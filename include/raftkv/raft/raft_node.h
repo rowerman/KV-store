@@ -32,6 +32,10 @@ struct RaftNodeOptions {
   uint64_t election_timeout_max_ms = 300;
   // ReadIndex 从入队到完成的最长等待时间。
   uint64_t read_index_timeout_ms = 1000;
+  // 距离上次快照新增的已应用日志数量达到该值时触发快照。
+  uint64_t snapshot_threshold_entries = 10000;
+  // InstallSnapshot 单块最大字节数。
+  uint64_t snapshot_chunk_size_bytes = 1024ULL * 1024ULL;
   // 0 表示使用运行时随机源；测试使用非 0 值获得可重复结果。
   uint64_t random_seed = 0;
 };
@@ -45,6 +49,7 @@ struct RaftNodeStatus {
   uint64_t commit_index = 0;
   uint64_t last_log_index = 0;
   uint64_t last_applied = 0;
+  uint64_t snapshot_index = 0;
   uint64_t processed_events = 0;
   uint64_t tick_count = 0;
   bool running = false;
@@ -88,6 +93,12 @@ struct AppendEntriesResponseEvent {
 
 struct InstallSnapshotResponseEvent {
   uint32_t peer_id = 0;
+  uint64_t request_sequence = 0;
+  uint64_t request_last_included_index = 0;
+  uint64_t request_last_included_term = 0;
+  uint64_t request_offset = 0;
+  uint64_t request_data_size = 0;
+  bool request_done = false;
   Status status;
   proto::InstallSnapshotResponse response;
 };

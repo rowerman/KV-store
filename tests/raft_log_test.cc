@@ -439,5 +439,41 @@ TEST(RaftLogTest, ValidatesDirectoryAndOptionsWithoutReplacingOutput) {
             Code::kInvalidArgument);
 }
 
+TEST(RaftLogTest, ResetsToInstalledSnapshotAndContinues) {
+  TempDir directory;
+  const std::string path = directory.Path("raft-log");
+  std::unique_ptr<RaftLog> log;
+  ASSERT_TRUE(RaftLog::Open(path, &log).ok());
+  ASSERT_TRUE(log->SaveHardState(5, std::nullopt).ok());
+  ASSERT_TRUE(log->Append(MakeEntries(1, 3, 2, 7)).ok());
+
+  ASSERT_TRUE(log->ResetToSnapshot(10, 3).ok());
+  EXPECT_EQ(log->FirstIndex(), 11U);
+  EXPECT_EQ(log->LastIndex(), 10U);
+  EXPECT_EQ(log->snapshot_marker().last_included_index, 10U);
+  EXPECT_EQ(log->snapshot_marker().last_included_term, 3U);
+  uint64_t term = 0;
+  ASSERT_TRUE(log->TermAt(10, &term).ok());
+  EXPECT_EQ(term, 3U);
+  EXPECT_EQ(log->EntryAt(1, nullptr).code(),
+            Code::kInvalidArgument);
+  EXPECT_TRUE(log->ResetToSnapshot(10, 3).ok());
+  EXPECT_EQ(log->ResetToSnapshot(9, 2).code(),
+            Code::kInvalidArgument);
+  EXPECT_EQ(log->ResetToSnapshot(11, 6).code(),
+            Code::kInvalidArgument);
+
+  const proto::LogEntry next =
+      MakeEntry(11, 5, proto::ENTRY_TYPE_NORMAL, "after-snapshot");
+  ASSERT_TRUE(log->Append({next}).ok());
+  EXPECT_EQ(log->LastIndex(), 11U);
+  log.reset();
+
+  ASSERT_TRUE(RaftLog::Open(path, &log).ok());
+  EXPECT_EQ(log->FirstIndex(), 11U);
+  EXPECT_EQ(log->LastIndex(), 11U);
+  ExpectEntry(*log, next);
+}
+
 }  // namespace
 }  // namespace raftkv

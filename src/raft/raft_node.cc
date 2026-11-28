@@ -4,6 +4,9 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cstring>
+#include <fcntl.h>
+#include <filesystem>
 #include <functional>
 #include <limits>
 #include <map>
@@ -12,14 +15,20 @@
 #include <random>
 #include <string>
 #include <system_error>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <unistd.h>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "raftkv/common/coding.h"
+#include "raftkv/common/crc32.h"
 #include "raftkv/common/mpsc_queue.h"
+#include "raftkv/raft/snapshot_bundle.h"
 
 namespace raftkv {
 namespace {
@@ -34,6 +43,14 @@ enum class Lifecycle {
 inline constexpr uint64_t kMaxTimerIntervalMs =
     24ULL * 60ULL * 60ULL * 1000ULL;
 inline constexpr uint64_t kMaxEntriesPerAppend = 64;
+inline constexpr char kSnapshotDirectoryName[] = "snapshots";
+inline constexpr char kInstallMarkerName[] = "INSTALLING";
+inline constexpr char kIncomingSnapshotName[] = "incoming.bundle";
+inline constexpr char kSnapshotStateName[] = "state";
+inline constexpr char kSnapshotBundleName[] = "snapshot.bundle";
+inline constexpr char kInstallMagic[] = "RFTINST1";
+
+namespace fs = std::filesystem;
 
 class ActorEventSink {
  public:
@@ -87,7 +104,228 @@ class NoopStateMachine final : public StateMachine {
   Status Apply(uint64_t, const std::string&) override {
     return Status::OK();
   }
+
+  Status TakeSnapshot(uint64_t, const std::string&) override {
+    return Status::OK();
+  }
+
+  Status LoadSnapshot(const std::string&) override {
+    return Status::OK();
+  }
 };
+
+std::string JoinPath(const std::string& directory,
+                     const std::string& name) {
+  if (!directory.empty() && directory.back() == '/') {
+    return directory + name;
+  }
+  return directory + "/" + name;
+}
+
+Status MakeIoError(const char* operation) {
+  const int saved_errno = errno;
+  return Status::IOError(
+      std::string(operation) + ": " +
+      std::strerror(saved_errno));
+}
+
+Status SyncDirectory(const std::string& directory) {
+  const int fd =
+      ::open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    return MakeIoError("open snapshot directory");
+  }
+  Status status = Status::OK();
+  while (::fsync(fd) < 0) {
+    if (errno == EINTR) {
+      continue;
+    }
+    status = MakeIoError("fsync snapshot directory");
+    break;
+  }
+  const int close_result = ::close(fd);
+  if (status.ok() && close_result < 0) {
+    return MakeIoError("close snapshot directory");
+  }
+  return status;
+}
+
+Status WriteAll(int fd, const char* data, size_t size,
+                const char* operation) {
+  size_t written = 0;
+  while (written < size) {
+    const ssize_t result =
+        ::write(fd, data + written, size - written);
+    if (result > 0) {
+      written += static_cast<size_t>(result);
+      continue;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    return MakeIoError(operation);
+  }
+  return Status::OK();
+}
+
+Status WriteAtAll(int fd, const char* data, size_t size,
+                  uint64_t offset, const char* operation) {
+  size_t written = 0;
+  while (written < size) {
+    const ssize_t result = ::pwrite(
+        fd, data + written, size - written,
+        static_cast<off_t>(offset + written));
+    if (result > 0) {
+      written += static_cast<size_t>(result);
+      continue;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    return MakeIoError(operation);
+  }
+  return Status::OK();
+}
+
+Status ReadAtExact(int fd, char* data, size_t size,
+                   uint64_t offset, const char* operation) {
+  size_t read_size = 0;
+  while (read_size < size) {
+    const ssize_t result = ::pread(
+        fd, data + read_size, size - read_size,
+        static_cast<off_t>(offset + read_size));
+    if (result > 0) {
+      read_size += static_cast<size_t>(result);
+      continue;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (result == 0) {
+      return Status::Corruption(
+          std::string(operation) + ": unexpected end of file");
+    }
+    return MakeIoError(operation);
+  }
+  return Status::OK();
+}
+
+Status ReadFile(const std::string& path, std::string* output) {
+  if (output == nullptr) {
+    return Status::InvalidArgument("snapshot file output is null");
+  }
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return MakeIoError("open snapshot metadata");
+  }
+  struct stat file_stat {};
+  if (::fstat(fd, &file_stat) < 0 || file_stat.st_size < 0) {
+    const Status status = MakeIoError("stat snapshot metadata");
+    ::close(fd);
+    return status;
+  }
+  std::string data(
+      static_cast<size_t>(file_stat.st_size), '\0');
+  size_t read_size = 0;
+  while (read_size < data.size()) {
+    const ssize_t result = ::read(
+        fd, data.data() + read_size, data.size() - read_size);
+    if (result > 0) {
+      read_size += static_cast<size_t>(result);
+      continue;
+    }
+    if (result < 0 && errno == EINTR) {
+      continue;
+    }
+    if (result == 0) {
+      ::close(fd);
+      return Status::Corruption(
+          "truncated snapshot metadata");
+    }
+    const Status status = MakeIoError("read snapshot metadata");
+    ::close(fd);
+    return status;
+  }
+  const int close_result = ::close(fd);
+  if (close_result < 0) {
+    return MakeIoError("close snapshot metadata");
+  }
+  output->swap(data);
+  return Status::OK();
+}
+
+std::string SnapshotDirectoryName(
+    uint64_t last_included_index, uint64_t last_included_term) {
+  return "snapshot-" + std::to_string(last_included_index) +
+         "-" + std::to_string(last_included_term);
+}
+
+Status EncodeInstallMarker(
+    uint64_t last_included_index, uint64_t last_included_term,
+    std::string* output) {
+  if (output == nullptr) {
+    return Status::InvalidArgument(
+        "snapshot install marker output is null");
+  }
+  std::string encoded;
+  encoded.reserve(sizeof(kInstallMagic) - 1 + sizeof(uint32_t) +
+                  sizeof(uint64_t) * 2 + sizeof(uint32_t));
+  encoded.append(kInstallMagic, sizeof(kInstallMagic) - 1);
+  const size_t version_offset = encoded.size();
+  encoded.resize(version_offset + sizeof(uint32_t));
+  EncodeFixed32(encoded.data() + version_offset, 1);
+  const size_t index_offset = encoded.size();
+  encoded.resize(index_offset + sizeof(uint64_t));
+  EncodeFixed64(encoded.data() + index_offset, last_included_index);
+  const size_t term_offset = encoded.size();
+  encoded.resize(term_offset + sizeof(uint64_t));
+  EncodeFixed64(encoded.data() + term_offset, last_included_term);
+  const size_t crc_offset = encoded.size();
+  encoded.resize(crc_offset + sizeof(uint32_t));
+  EncodeFixed32(
+      encoded.data() + crc_offset,
+      Crc32(encoded.data(), crc_offset));
+  output->swap(encoded);
+  return Status::OK();
+}
+
+Status DecodeInstallMarker(
+    const std::string& encoded, uint64_t* last_included_index,
+    uint64_t* last_included_term) {
+  if (last_included_index == nullptr ||
+      last_included_term == nullptr) {
+    return Status::InvalidArgument(
+        "snapshot install marker output is null");
+  }
+  const size_t expected_size =
+      sizeof(kInstallMagic) - 1 + sizeof(uint32_t) +
+      sizeof(uint64_t) * 2 + sizeof(uint32_t);
+  if (encoded.size() != expected_size ||
+      std::memcmp(
+          encoded.data(), kInstallMagic,
+          sizeof(kInstallMagic) - 1) != 0) {
+    return Status::Corruption("invalid snapshot install marker");
+  }
+  size_t offset = sizeof(kInstallMagic) - 1;
+  const uint32_t version = DecodeFixed32(encoded.data() + offset);
+  offset += sizeof(uint32_t);
+  if (version != 1) {
+    return Status::Corruption(
+        "unsupported snapshot install marker version");
+  }
+  const uint64_t index = DecodeFixed64(encoded.data() + offset);
+  offset += sizeof(uint64_t);
+  const uint64_t term = DecodeFixed64(encoded.data() + offset);
+  offset += sizeof(uint64_t);
+  const uint32_t checksum = DecodeFixed32(encoded.data() + offset);
+  if (index == 0 || term == 0 ||
+      Crc32(encoded.data(), offset) != checksum) {
+    return Status::Corruption("invalid snapshot install marker");
+  }
+  *last_included_index = index;
+  *last_included_term = term;
+  return Status::OK();
+}
 
 }  // namespace
 
@@ -112,7 +350,9 @@ struct RaftNode::Impl {
         status_leader(0),
         status_commit(commit_index),
         status_last_log(log->LastIndex()),
-        status_last_applied(last_applied) {
+        status_last_applied(last_applied),
+        status_snapshot(
+            log->snapshot_marker().last_included_index) {
     election_random.seed(MakeElectionSeed(options));
     InstallHandlers();
   }
@@ -176,6 +416,14 @@ struct RaftNode::Impl {
       const AppendEntriesResponseEvent& event);
   Status OnInstallSnapshotResponse(
       const InstallSnapshotResponseEvent& event);
+  Status RecoverSnapshotState();
+  Status MaybeCreateSnapshot();
+  Status CreateLocalSnapshot();
+  Status SendInstallSnapshotChunk(uint32_t peer_id);
+  Status InstallIncomingSnapshot();
+  Status PersistInstallMarker(
+      uint64_t last_included_index, uint64_t last_included_term);
+  Status RemoveInstallMarker();
 
   std::chrono::milliseconds NextElectionTimeout();
   void ResetElectionDeadline(Clock::time_point now);
@@ -210,6 +458,9 @@ struct RaftNode::Impl {
         log->LastIndex(), std::memory_order_relaxed);
     status_last_applied.store(
         last_applied, std::memory_order_relaxed);
+    status_snapshot.store(
+        log->snapshot_marker().last_included_index,
+        std::memory_order_relaxed);
   }
 
   RaftNodeOptions options;
@@ -247,15 +498,24 @@ struct RaftNode::Impl {
   std::atomic<uint64_t> status_commit;
   std::atomic<uint64_t> status_last_log;
   std::atomic<uint64_t> status_last_applied;
+  std::atomic<uint64_t> status_snapshot;
 
   std::atomic<uint64_t> processed_events{0};
   std::atomic<uint64_t> tick_count{0};
 
   struct PeerReplicationState {
+    enum class InflightKind {
+      kNone,
+      kAppendEntries,
+      kInstallSnapshot,
+    };
+
     uint64_t next_index = 1;
     uint64_t match_index = 0;
     uint64_t inflight_sequence = 0;
-    bool inflight = false;
+    uint64_t snapshot_offset = 0;
+    uint64_t snapshot_transfer_index = 0;
+    InflightKind inflight_kind = InflightKind::kNone;
   };
 
   struct PendingRead {
@@ -267,11 +527,30 @@ struct RaftNode::Impl {
     bool started = false;
   };
 
+  struct LocalSnapshot {
+    uint64_t last_included_index = 0;
+    uint64_t last_included_term = 0;
+    std::string directory;
+    std::string bundle_path;
+    uint64_t bundle_size = 0;
+  };
+
+  struct IncomingSnapshot {
+    uint32_t leader_id = 0;
+    uint64_t last_included_index = 0;
+    uint64_t last_included_term = 0;
+    uint64_t next_offset = 0;
+    std::string bundle_path;
+  };
+
   std::unordered_map<uint32_t, PeerReplicationState> replication_;
   std::map<uint64_t, ProposeCallback> pending_proposals_;
   std::map<uint64_t, PendingRead> pending_reads_;
+  std::optional<LocalSnapshot> local_snapshot_;
+  std::optional<IncomingSnapshot> incoming_snapshot_;
   uint64_t next_append_sequence_ = 1;
   uint64_t next_read_ctx_id_ = 1;
+  uint64_t next_snapshot_sequence_ = 1;
 };
 
 void RaftNode::Impl::InstallHandlers() {
@@ -385,6 +664,294 @@ Status RaftNode::Impl::PersistHardState(
   voted_for = new_voted_for;
   PublishStatus();
   return Status::OK();
+}
+
+Status RaftNode::Impl::RecoverSnapshotState() {
+  const std::string snapshot_root =
+      JoinPath(log->directory(), kSnapshotDirectoryName);
+  const std::string incoming_directory =
+      JoinPath(snapshot_root, "incoming");
+  std::error_code error;
+  fs::create_directories(incoming_directory, error);
+  if (error) {
+    return Status::IOError(
+        "create raft snapshot directory: " + error.message());
+  }
+
+  bool loaded_state_directory = false;
+  const std::string install_marker_path =
+      JoinPath(snapshot_root, kInstallMarkerName);
+  if (fs::exists(install_marker_path, error)) {
+    // 先重放安装事务，再允许 Actor 启动。
+    if (error) {
+      return Status::IOError(
+          "inspect snapshot install marker: " + error.message());
+    }
+    std::string encoded;
+    Status status = ReadFile(install_marker_path, &encoded);
+    if (!status.ok()) {
+      return status;
+    }
+    uint64_t snapshot_index = 0;
+    uint64_t snapshot_term = 0;
+    status = DecodeInstallMarker(
+        encoded, &snapshot_index, &snapshot_term);
+    if (!status.ok()) {
+      return status;
+    }
+    const std::string snapshot_directory = JoinPath(
+        snapshot_root,
+        SnapshotDirectoryName(snapshot_index, snapshot_term));
+    const std::string state_directory =
+        JoinPath(snapshot_directory, kSnapshotStateName);
+    if (!fs::is_directory(state_directory, error) || error) {
+      return Status::Corruption(
+          "snapshot install state directory is missing");
+    }
+    status = state_machine->LoadSnapshot(state_directory);
+    if (!status.ok()) {
+      return status;
+    }
+    status =
+        log->ResetToSnapshot(snapshot_index, snapshot_term);
+    if (!status.ok()) {
+      return status;
+    }
+    commit_index = snapshot_index;
+    last_applied = snapshot_index;
+    PublishStatus();
+    status = RemoveInstallMarker();
+    if (!status.ok()) {
+      return status;
+    }
+    loaded_state_directory = true;
+  } else if (error) {
+    return Status::IOError(
+        "inspect snapshot install marker: " + error.message());
+  }
+
+  const RaftSnapshotMarker& marker = log->snapshot_marker();
+  if (marker.last_included_index != 0) {
+    // 本地持久化状态机从当前快照恢复，并保留可发送的 bundle。
+    const std::string directory = JoinPath(
+        snapshot_root,
+        SnapshotDirectoryName(
+            marker.last_included_index,
+            marker.last_included_term));
+    const std::string bundle_path =
+        JoinPath(directory, kSnapshotBundleName);
+    uint64_t bundle_size = 0;
+    Status status =
+        ValidateSnapshotBundle(bundle_path, &bundle_size);
+    if (!status.ok()) {
+      return status;
+    }
+    if (!loaded_state_directory) {
+      status = state_machine->LoadSnapshot(
+          JoinPath(directory, kSnapshotStateName));
+      if (!status.ok()) {
+        return status;
+      }
+    }
+    local_snapshot_ = LocalSnapshot{
+        marker.last_included_index,
+        marker.last_included_term,
+        directory,
+        bundle_path,
+        bundle_size};
+  }
+
+  for (const fs::directory_entry& entry :
+       fs::directory_iterator(snapshot_root, error)) {
+    if (error) {
+      return Status::IOError(
+          "scan raft snapshot directory: " + error.message());
+    }
+    const std::string name = entry.path().filename().string();
+    if (name == "incoming" ||
+        (local_snapshot_.has_value() &&
+         entry.path() == local_snapshot_->directory)) {
+      continue;
+    }
+    fs::remove_all(entry.path(), error);
+    if (error) {
+      return Status::IOError(
+          "clean stale raft snapshot: " + error.message());
+    }
+  }
+  fs::remove_all(incoming_directory, error);
+  if (error) {
+    return Status::IOError(
+        "clean incoming raft snapshot: " + error.message());
+  }
+  fs::create_directories(incoming_directory, error);
+  if (error) {
+    return Status::IOError(
+        "recreate incoming raft snapshot: " + error.message());
+  }
+  return Status::OK();
+}
+
+Status RaftNode::Impl::MaybeCreateSnapshot() {
+  const uint64_t last_snapshot_index =
+      log->snapshot_marker().last_included_index;
+  if (last_applied <= last_snapshot_index ||
+      last_applied - last_snapshot_index <
+          options.snapshot_threshold_entries) {
+    return Status::OK();
+  }
+  return CreateLocalSnapshot();
+}
+
+Status RaftNode::Impl::CreateLocalSnapshot() {
+  const uint64_t snapshot_index = last_applied;
+  uint64_t snapshot_term = 0;
+  Status status = log->TermAt(snapshot_index, &snapshot_term);
+  if (!status.ok()) {
+    return status;
+  }
+  const std::string snapshot_root =
+      JoinPath(log->directory(), kSnapshotDirectoryName);
+  const std::string snapshot_name =
+      SnapshotDirectoryName(snapshot_index, snapshot_term);
+  const std::string final_directory =
+      JoinPath(snapshot_root, snapshot_name);
+  const std::string temporary_directory = JoinPath(
+      snapshot_root,
+      snapshot_name + ".tmp-" + std::to_string(::getpid()));
+  const std::string state_directory =
+      JoinPath(temporary_directory, kSnapshotStateName);
+  const std::string bundle_path =
+      JoinPath(temporary_directory, kSnapshotBundleName);
+
+  std::error_code error;
+  fs::remove_all(temporary_directory, error);
+  error.clear();
+  fs::create_directories(state_directory, error);
+  if (error) {
+    return Status::IOError(
+        "create temporary raft snapshot: " + error.message());
+  }
+  const auto cleanup = [&]() {
+    std::error_code ignored;
+    fs::remove_all(temporary_directory, ignored);
+  };
+
+  // 先完成快照目录和 bundle，再推进 RaftLog 边界。
+  status = state_machine->TakeSnapshot(
+      snapshot_index, state_directory);
+  if (!status.ok()) {
+    cleanup();
+    return status;
+  }
+  status = PackSnapshotDirectory(state_directory, bundle_path);
+  if (!status.ok()) {
+    cleanup();
+    return status;
+  }
+  uint64_t bundle_size = 0;
+  status = ValidateSnapshotBundle(bundle_path, &bundle_size);
+  if (!status.ok()) {
+    cleanup();
+    return status;
+  }
+
+  fs::remove_all(final_directory, error);
+  error.clear();
+  fs::rename(temporary_directory, final_directory, error);
+  if (error) {
+    cleanup();
+    return Status::IOError(
+        "publish raft snapshot: " + error.message());
+  }
+  status = SyncDirectory(snapshot_root);
+  if (!status.ok()) {
+    return status;
+  }
+
+  // 快照已持久化，此时才能删除对应日志前缀。
+  status =
+      log->CompactPrefix(snapshot_index, snapshot_term);
+  if (!status.ok()) {
+    return status;
+  }
+  local_snapshot_ = LocalSnapshot{
+      snapshot_index,
+      snapshot_term,
+      final_directory,
+      JoinPath(final_directory, kSnapshotBundleName),
+      bundle_size};
+  PublishStatus();
+
+  for (const fs::directory_entry& entry :
+       fs::directory_iterator(snapshot_root, error)) {
+    if (error) {
+      return Status::IOError(
+          "scan old raft snapshots: " + error.message());
+    }
+    if (entry.path() == final_directory ||
+        entry.path().filename() == "incoming") {
+      continue;
+    }
+    fs::remove_all(entry.path(), error);
+    if (error) {
+      return Status::IOError(
+          "remove old raft snapshot: " + error.message());
+    }
+  }
+  return Status::OK();
+}
+
+Status RaftNode::Impl::PersistInstallMarker(
+    uint64_t last_included_index, uint64_t last_included_term) {
+  std::string encoded;
+  Status status = EncodeInstallMarker(
+      last_included_index, last_included_term, &encoded);
+  if (!status.ok()) {
+    return status;
+  }
+  const std::string snapshot_root =
+      JoinPath(log->directory(), kSnapshotDirectoryName);
+  const std::string target =
+      JoinPath(snapshot_root, kInstallMarkerName);
+  const std::string temporary = target + ".tmp";
+  const int fd = ::open(
+      temporary.c_str(),
+      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return MakeIoError("create snapshot install marker");
+  }
+  status = WriteAll(
+      fd, encoded.data(), encoded.size(),
+      "write snapshot install marker");
+  if (status.ok() && ::fsync(fd) < 0) {
+    status = MakeIoError("fsync snapshot install marker");
+  }
+  const int close_result = ::close(fd);
+  if (status.ok() && close_result < 0) {
+    status = MakeIoError("close snapshot install marker");
+  }
+  if (!status.ok()) {
+    ::unlink(temporary.c_str());
+    return status;
+  }
+  if (::rename(temporary.c_str(), target.c_str()) < 0) {
+    status = MakeIoError("rename snapshot install marker");
+    ::unlink(temporary.c_str());
+    return status;
+  }
+  return SyncDirectory(snapshot_root);
+}
+
+Status RaftNode::Impl::RemoveInstallMarker() {
+  const std::string snapshot_root =
+      JoinPath(log->directory(), kSnapshotDirectoryName);
+  const std::string marker =
+      JoinPath(snapshot_root, kInstallMarkerName);
+  if (::unlink(marker.c_str()) < 0 && errno != ENOENT) {
+    return MakeIoError("remove snapshot install marker");
+  }
+  return SyncDirectory(snapshot_root);
 }
 
 void RaftNode::Impl::ResetReplicationProgress() {
@@ -693,6 +1260,10 @@ Status RaftNode::Impl::ApplyCommitted() {
         done(Status::OK());
       }
     }
+    Status snapshot_status = MaybeCreateSnapshot();
+    if (!snapshot_status.ok()) {
+      return snapshot_status;
+    }
   }
   return Status::OK();
 }
@@ -805,9 +1376,9 @@ Status RaftNode::Impl::BuildConflictResponse(
     if (status.code() != Code::kNotFound) {
       return status;
     }
-    response->set_conflict_term(
-        log->snapshot_marker().last_included_term);
-    response->set_conflict_index(log->FirstIndex());
+    response->set_conflict_term(0);
+    response->set_conflict_index(
+        log->snapshot_marker().last_included_index);
     return Status::OK();
   }
 
@@ -1095,8 +1666,20 @@ Status RaftNode::Impl::ReplicateToPeer(uint32_t peer_id) {
     return Status::Corruption("raft peer replication state is missing");
   }
   PeerReplicationState& progress = replication->second;
-  if (progress.inflight) {
+  if (progress.inflight_kind !=
+      PeerReplicationState::InflightKind::kNone) {
     return Status::OK();
+  }
+  if (progress.next_index <=
+      log->snapshot_marker().last_included_index) {
+    // 所需日志已被压缩时，必须先安装快照。
+    if (progress.snapshot_transfer_index !=
+        log->snapshot_marker().last_included_index) {
+      progress.snapshot_transfer_index =
+          log->snapshot_marker().last_included_index;
+      progress.snapshot_offset = 0;
+    }
+    return SendInstallSnapshotChunk(peer_id);
   }
   if (next_append_sequence_ ==
       std::numeric_limits<uint64_t>::max()) {
@@ -1139,7 +1722,8 @@ Status RaftNode::Impl::ReplicateToPeer(uint32_t peer_id) {
   }
 
   const uint64_t sequence = next_append_sequence_++;
-  progress.inflight = true;
+  progress.inflight_kind =
+      PeerReplicationState::InflightKind::kAppendEntries;
   progress.inflight_sequence = sequence;
   const std::weak_ptr<ActorEventSink> weak_sink = event_sink;
   transport->SendAppendEntries(
@@ -1153,6 +1737,221 @@ Status RaftNode::Impl::ReplicateToPeer(uint32_t peer_id) {
               std::move(response_status), std::move(response)});
         }
       });
+  return Status::OK();
+}
+
+Status RaftNode::Impl::SendInstallSnapshotChunk(
+    uint32_t peer_id) {
+  if (role != Role::kLeader || !IsConfiguredPeer(peer_id)) {
+    return Status::OK();
+  }
+  const auto replication = replication_.find(peer_id);
+  if (replication == replication_.end()) {
+    return Status::Corruption(
+        "raft peer snapshot state is missing");
+  }
+  PeerReplicationState& progress = replication->second;
+  if (progress.inflight_kind !=
+      PeerReplicationState::InflightKind::kNone) {
+    return Status::OK();
+  }
+  if (!local_snapshot_.has_value() ||
+      local_snapshot_->last_included_index !=
+          log->snapshot_marker().last_included_index ||
+      local_snapshot_->last_included_term !=
+          log->snapshot_marker().last_included_term) {
+    return Status::Corruption(
+        "raft snapshot source is unavailable");
+  }
+  if (next_snapshot_sequence_ ==
+      std::numeric_limits<uint64_t>::max()) {
+    return Status::Corruption(
+        "raft snapshot sequence is exhausted");
+  }
+
+  const int fd = ::open(
+      local_snapshot_->bundle_path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return MakeIoError("open raft snapshot bundle");
+  }
+  const uint64_t offset = progress.snapshot_offset;
+  if (offset > local_snapshot_->bundle_size) {
+    ::close(fd);
+    return Status::Corruption(
+        "raft snapshot offset exceeds bundle size");
+  }
+  const uint64_t remaining =
+      local_snapshot_->bundle_size - offset;
+  const uint64_t data_size = std::min<uint64_t>(
+      remaining, options.snapshot_chunk_size_bytes);
+  std::string data(static_cast<size_t>(data_size), '\0');
+  Status status = data.empty()
+                      ? Status::OK()
+                      : ReadAtExact(
+                            fd, data.data(), data.size(), offset,
+                            "read raft snapshot chunk");
+  const int close_result = ::close(fd);
+  if (status.ok() && close_result < 0) {
+    status = MakeIoError("close raft snapshot bundle");
+  }
+  if (!status.ok()) {
+    return status;
+  }
+
+  proto::InstallSnapshotRequest request;
+  request.set_term(current_term);
+  request.set_leader_id(options.node_id);
+  request.set_last_included_index(
+      local_snapshot_->last_included_index);
+  request.set_last_included_term(
+      local_snapshot_->last_included_term);
+  request.set_offset(offset);
+  request.set_data(std::move(data));
+  const bool done = offset + data_size == local_snapshot_->bundle_size;
+  request.set_done(done);
+
+  const uint64_t sequence = next_snapshot_sequence_++;
+  progress.inflight_kind =
+      PeerReplicationState::InflightKind::kInstallSnapshot;
+  progress.inflight_sequence = sequence;
+  progress.snapshot_offset = offset;
+  const uint64_t data_size_copy = data_size;
+  const uint64_t snapshot_index =
+      local_snapshot_->last_included_index;
+  const uint64_t snapshot_term =
+      local_snapshot_->last_included_term;
+  const std::weak_ptr<ActorEventSink> weak_sink = event_sink;
+  transport->SendInstallSnapshot(
+      peer_id, request,
+      [weak_sink, peer_id, sequence, snapshot_index, snapshot_term,
+       offset, data_size_copy, done](
+          Status response_status,
+          proto::InstallSnapshotResponse response) {
+        if (const auto sink = weak_sink.lock()) {
+          sink->Post(InstallSnapshotResponseEvent{
+              peer_id, sequence, snapshot_index, snapshot_term,
+              offset, data_size_copy, done,
+              std::move(response_status), std::move(response)});
+        }
+      });
+  return Status::OK();
+}
+
+Status RaftNode::Impl::InstallIncomingSnapshot() {
+  if (!incoming_snapshot_.has_value()) {
+    return Status::Corruption(
+        "incoming raft snapshot state is missing");
+  }
+  const uint64_t snapshot_index =
+      incoming_snapshot_->last_included_index;
+  const uint64_t snapshot_term =
+      incoming_snapshot_->last_included_term;
+  const std::string incoming_bundle =
+      incoming_snapshot_->bundle_path;
+  uint64_t bundle_size = 0;
+  Status status =
+      ValidateSnapshotBundle(incoming_bundle, &bundle_size);
+  if (!status.ok()) {
+    return status;
+  }
+
+  const std::string snapshot_root =
+      JoinPath(log->directory(), kSnapshotDirectoryName);
+  const std::string snapshot_name =
+      SnapshotDirectoryName(snapshot_index, snapshot_term);
+  const std::string final_directory =
+      JoinPath(snapshot_root, snapshot_name);
+  const std::string temporary_directory = JoinPath(
+      snapshot_root,
+      snapshot_name + ".tmp-install-" + std::to_string(::getpid()));
+  std::error_code error;
+  fs::remove_all(temporary_directory, error);
+  error.clear();
+  const std::string temporary_state =
+      JoinPath(temporary_directory, kSnapshotStateName);
+  status =
+      UnpackSnapshotDirectory(incoming_bundle, temporary_state);
+  if (!status.ok()) {
+    fs::remove_all(temporary_directory, error);
+    return status;
+  }
+  const std::string temporary_bundle =
+      JoinPath(temporary_directory, kSnapshotBundleName);
+  fs::rename(incoming_bundle, temporary_bundle, error);
+  if (error) {
+    fs::remove_all(temporary_directory, error);
+    return Status::IOError(
+        "move incoming raft snapshot: " + error.message());
+  }
+  fs::remove_all(final_directory, error);
+  error.clear();
+  fs::rename(temporary_directory, final_directory, error);
+  if (error) {
+    fs::remove_all(temporary_directory, error);
+    return Status::IOError(
+        "publish incoming raft snapshot: " + error.message());
+  }
+  status = SyncDirectory(snapshot_root);
+  if (!status.ok()) {
+    return status;
+  }
+  // 安装事务覆盖“加载状态机”和“重置日志”之间的崩溃窗口。
+  status =
+      PersistInstallMarker(snapshot_index, snapshot_term);
+  if (!status.ok()) {
+    return status;
+  }
+
+  const std::string final_state =
+      JoinPath(final_directory, kSnapshotStateName);
+  status = state_machine->LoadSnapshot(final_state);
+  if (!status.ok()) {
+    return status;
+  }
+  status = log->ResetToSnapshot(snapshot_index, snapshot_term);
+  if (!status.ok()) {
+    return status;
+  }
+  commit_index = snapshot_index;
+  last_applied = snapshot_index;
+  local_snapshot_ = LocalSnapshot{
+      snapshot_index,
+      snapshot_term,
+      final_directory,
+      JoinPath(final_directory, kSnapshotBundleName),
+      bundle_size};
+  incoming_snapshot_.reset();
+  PublishStatus();
+
+  status = RemoveInstallMarker();
+  if (!status.ok()) {
+    return status;
+  }
+  for (const fs::directory_entry& entry :
+       fs::directory_iterator(snapshot_root, error)) {
+    if (error) {
+      return Status::IOError(
+          "scan installed raft snapshots: " + error.message());
+    }
+    if (entry.path() == final_directory ||
+        entry.path().filename() == "incoming") {
+      continue;
+    }
+    fs::remove_all(entry.path(), error);
+    if (error) {
+      return Status::IOError(
+          "remove replaced raft snapshot: " + error.message());
+    }
+  }
+  const std::string incoming_directory =
+      JoinPath(snapshot_root, "incoming");
+  fs::remove_all(incoming_directory, error);
+  error.clear();
+  fs::create_directories(incoming_directory, error);
+  if (error) {
+    return Status::IOError(
+        "reset incoming raft snapshot directory: " + error.message());
+  }
   return Status::OK();
 }
 
@@ -1177,7 +1976,8 @@ Status RaftNode::Impl::BroadcastHeartbeat() {
   for (uint32_t peer_id : options.peers) {
     const auto replication = replication_.find(peer_id);
     if (replication == replication_.end() ||
-        !replication->second.inflight) {
+        replication->second.inflight_kind ==
+            PeerReplicationState::InflightKind::kNone) {
       Status replicate_status = ReplicateToPeer(peer_id);
       if (!replicate_status.ok()) {
         return replicate_status;
@@ -1392,7 +2192,8 @@ Status RaftNode::Impl::OnInstallSnapshotRequest(
   proto::InstallSnapshotResponse response;
   response.set_term(current_term);
   response.set_success(false);
-  const auto complete = [&](Status status) {
+  const auto complete = [&](Status status, bool success) {
+    response.set_success(success);
     if (event.done != nullptr) {
       event.done(std::move(status), response);
     }
@@ -1401,32 +2202,150 @@ Status RaftNode::Impl::OnInstallSnapshotRequest(
   if (event.request.term() == 0 ||
       event.request.leader_id() == 0 ||
       event.request.leader_id() != event.from_peer_id ||
-      !IsConfiguredPeer(event.request.leader_id())) {
-    complete(Status::OK());
+      !IsConfiguredPeer(event.request.leader_id()) ||
+      event.request.last_included_index() == 0 ||
+      event.request.last_included_index() ==
+          std::numeric_limits<uint64_t>::max() ||
+      event.request.last_included_term() == 0 ||
+      event.request.last_included_term() > event.request.term()) {
+    complete(Status::OK(), false);
     PublishStatus();
     return Status::OK();
   }
   if (event.request.term() < current_term) {
-    complete(Status::OK());
+    complete(Status::OK(), false);
     PublishStatus();
     return Status::OK();
   }
   if (event.request.term() > current_term) {
     Status status = ObserveHigherTerm(event.request.term(), now);
     if (!status.ok()) {
-      complete(status);
+      complete(status, false);
       return status;
     }
     response.set_term(current_term);
   }
-  if (role != Role::kLeader) {
-    role = Role::kFollower;
-    leader_id = event.request.leader_id();
-    ClearElectionVotes();
-    ResetElectionDeadline(now);
+  if (role == Role::kLeader) {
+    complete(Status::OK(), false);
+    PublishStatus();
+    return Status::OK();
+  }
+
+  role = Role::kFollower;
+  leader_id = event.request.leader_id();
+  ClearElectionVotes();
+  ResetElectionDeadline(now);
+  PublishStatus();
+
+  const uint64_t snapshot_index =
+      event.request.last_included_index();
+  const uint64_t snapshot_term =
+      event.request.last_included_term();
+  if (snapshot_index == log->snapshot_marker().last_included_index &&
+      snapshot_term == log->snapshot_marker().last_included_term) {
+    if (event.request.offset() >
+        std::numeric_limits<uint64_t>::max() -
+            event.request.data().size()) {
+      complete(Status::OK(), false);
+      return Status::OK();
+    }
+    response.set_received_offset(
+        event.request.offset() + event.request.data().size());
+    complete(Status::OK(), true);
+    return Status::OK();
+  }
+  if (snapshot_index < commit_index ||
+      snapshot_index <=
+          log->snapshot_marker().last_included_index) {
+    complete(Status::OK(), false);
+    return Status::OK();
+  }
+  if (event.request.data().size() > kMaxSnapshotChunkSize ||
+      (event.request.data().empty() && !event.request.done())) {
+    complete(Status::OK(), false);
+    return Status::OK();
+  }
+
+  const std::string snapshot_root =
+      JoinPath(log->directory(), kSnapshotDirectoryName);
+  const std::string incoming_directory =
+      JoinPath(snapshot_root, "incoming");
+  const std::string bundle_path =
+      JoinPath(incoming_directory, kIncomingSnapshotName);
+  std::error_code error;
+  if (event.request.offset() == 0) {
+    // 新快照从 offset 0 开始，旧半成品直接丢弃。
+    fs::remove_all(incoming_directory, error);
+    error.clear();
+    fs::create_directories(incoming_directory, error);
+    if (error) {
+      const Status status = Status::IOError(
+          "reset incoming raft snapshot: " + error.message());
+      complete(status, false);
+      return status;
+    }
+    incoming_snapshot_ = IncomingSnapshot{
+        event.request.leader_id(), snapshot_index, snapshot_term, 0,
+        bundle_path};
+  }
+  if (!incoming_snapshot_.has_value() ||
+      incoming_snapshot_->leader_id != event.request.leader_id() ||
+      incoming_snapshot_->last_included_index != snapshot_index ||
+      incoming_snapshot_->last_included_term != snapshot_term) {
+    complete(Status::OK(), false);
+    return Status::OK();
+  }
+  if (event.request.offset() != incoming_snapshot_->next_offset) {
+    // 只接受连续块，并告诉 Leader 当前期望位置。
+    response.set_received_offset(incoming_snapshot_->next_offset);
+    complete(Status::OK(), false);
+    return Status::OK();
+  }
+  if (event.request.offset() >
+      std::numeric_limits<uint64_t>::max() -
+          event.request.data().size()) {
+    complete(Status::OK(), false);
+    return Status::OK();
+  }
+
+  const int flags =
+      event.request.offset() == 0
+          ? O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC
+          : O_WRONLY | O_CREAT | O_CLOEXEC;
+  const int fd = ::open(bundle_path.c_str(), flags, 0644);
+  if (fd < 0) {
+    const Status status = MakeIoError("open incoming raft snapshot");
+    complete(status, false);
+    return status;
+  }
+  Status status = WriteAtAll(
+      fd, event.request.data().data(), event.request.data().size(),
+      event.request.offset(), "write incoming raft snapshot");
+  if (status.ok() && event.request.done() && ::fsync(fd) < 0) {
+    status = MakeIoError("fsync incoming raft snapshot");
+  }
+  const int close_result = ::close(fd);
+  if (status.ok() && close_result < 0) {
+    status = MakeIoError("close incoming raft snapshot");
+  }
+  if (!status.ok()) {
+    complete(status, false);
+    return status;
+  }
+
+  const uint64_t received_offset =
+      event.request.offset() + event.request.data().size();
+  incoming_snapshot_->next_offset = received_offset;
+  response.set_received_offset(received_offset);
+  if (event.request.done()) {
+    status = InstallIncomingSnapshot();
+    if (!status.ok()) {
+      complete(status, false);
+      return status;
+    }
   }
   PublishStatus();
-  complete(Status::OK());
+  complete(Status::OK(), true);
   return Status::OK();
 }
 
@@ -1476,12 +2395,14 @@ Status RaftNode::Impl::OnAppendEntriesResponse(
   }
   const auto replication = replication_.find(event.peer_id);
   if (replication == replication_.end() ||
-      !replication->second.inflight ||
+      replication->second.inflight_kind !=
+          PeerReplicationState::InflightKind::kAppendEntries ||
       replication->second.inflight_sequence !=
           event.request_sequence) {
     return Status::OK();
   }
-  replication->second.inflight = false;
+  replication->second.inflight_kind =
+      PeerReplicationState::InflightKind::kNone;
   replication->second.inflight_sequence = 0;
 
   if (!event.status.ok()) {
@@ -1528,13 +2449,60 @@ Status RaftNode::Impl::OnAppendEntriesResponse(
 
 Status RaftNode::Impl::OnInstallSnapshotResponse(
     const InstallSnapshotResponseEvent& event) {
-  if (!event.status.ok() || !IsConfiguredPeer(event.peer_id)) {
+  if (!IsConfiguredPeer(event.peer_id)) {
     return Status::OK();
   }
-  if (event.response.term() > current_term) {
+  if (event.status.ok() &&
+      event.response.term() > current_term) {
     return ObserveHigherTerm(event.response.term(), Clock::now());
   }
-  return Status::OK();
+  const auto replication = replication_.find(event.peer_id);
+  if (replication == replication_.end() ||
+      replication->second.inflight_kind !=
+          PeerReplicationState::InflightKind::kInstallSnapshot ||
+      replication->second.inflight_sequence !=
+          event.request_sequence) {
+    return Status::OK();
+  }
+  replication->second.inflight_kind =
+      PeerReplicationState::InflightKind::kNone;
+  replication->second.inflight_sequence = 0;
+  if (!event.status.ok() || role != Role::kLeader ||
+      event.response.term() != current_term ||
+      !event.response.success()) {
+    return Status::OK();
+  }
+  if (event.request_offset >
+      std::numeric_limits<uint64_t>::max() -
+          event.request_data_size) {
+    return Status::Corruption("raft snapshot offset overflow");
+  }
+  const uint64_t expected_offset =
+      event.request_offset + event.request_data_size;
+  if (event.response.received_offset() != expected_offset) {
+    return Status::OK();
+  }
+
+  if (event.request_done) {
+    const uint64_t matched = event.request_last_included_index;
+    if (!local_snapshot_.has_value() ||
+        local_snapshot_->last_included_index != matched ||
+        local_snapshot_->last_included_term !=
+            event.request_last_included_term) {
+      return Status::OK();
+    }
+    replication->second.match_index =
+        std::max(replication->second.match_index, matched);
+    replication->second.next_index =
+        matched == std::numeric_limits<uint64_t>::max()
+            ? matched
+            : matched + 1;
+    replication->second.snapshot_offset = 0;
+    replication->second.snapshot_transfer_index = 0;
+    return ReplicateToPeer(event.peer_id);
+  }
+  replication->second.snapshot_offset = expected_offset;
+  return ReplicateToPeer(event.peer_id);
 }
 
 Status RaftNode::Impl::Start() {
@@ -1636,6 +2604,8 @@ RaftNodeStatus RaftNode::Impl::GetStatus() const {
       status_last_log.load(std::memory_order_relaxed);
   status.last_applied =
       status_last_applied.load(std::memory_order_relaxed);
+  status.snapshot_index =
+      status_snapshot.load(std::memory_order_relaxed);
   status.processed_events =
       processed_events.load(std::memory_order_relaxed);
   status.tick_count =
@@ -1831,6 +2801,16 @@ Status RaftNode::Create(
     return Status::InvalidArgument(
         "raft read index timeout is invalid");
   }
+  if (options.snapshot_threshold_entries == 0) {
+    return Status::InvalidArgument(
+        "raft snapshot threshold is invalid");
+  }
+  if (options.snapshot_chunk_size_bytes == 0 ||
+      options.snapshot_chunk_size_bytes >
+          kMaxSnapshotChunkSize) {
+    return Status::InvalidArgument(
+        "raft snapshot chunk size is invalid");
+  }
 
   std::unordered_set<uint32_t> peers;
   for (uint32_t peer : options.peers) {
@@ -1844,6 +2824,10 @@ Status RaftNode::Create(
   auto impl = std::make_unique<Impl>(
       std::move(options), std::move(transport), std::move(log),
       std::move(state_machine));
+  Status status = impl->RecoverSnapshotState();
+  if (!status.ok()) {
+    return status;
+  }
   *node = std::unique_ptr<RaftNode>(
       new RaftNode(std::move(impl)));
   return Status::OK();

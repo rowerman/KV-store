@@ -68,6 +68,11 @@ class RaftLog {
   // 把 up_to_index 及其之前日志标记为快照覆盖范围。
   Status CompactPrefix(uint64_t up_to_index, uint64_t last_term);
 
+  // 直接采用远端快照边界，并删除不再需要的本地日志。
+  Status ResetToSnapshot(
+      uint64_t last_included_index,
+      uint64_t last_included_term);
+
   // 原子保存任期和投票对象。
   Status SaveHardState(uint64_t current_term,
                        std::optional<uint32_t> voted_for);

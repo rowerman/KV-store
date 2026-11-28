@@ -315,7 +315,7 @@ sudo apt install -y \
 - **测试验收**：把旧 Leader 隔离在少数派分区，向旧 Leader 发起 `ReadIndex`，验证其永远不会返回成功（最终超时拒绝），杜绝脑裂脏读。
 - **实现补充**：完成当前 term 提交门槛、独立 `read_ctx_id` 确认心跳、成功后回填上下文、多数派去重确认、Apply 进度等待、降级/超时/Actor 停止清理；ReadIndex 心跳不占用复制序号。新增 9 个 ReadIndex 测试，Debug、ASan/UBSan、TSan 均通过，TSan 连续 10 轮通过。
 
-### [ ] F4.7 `InstallSnapshot` 日志压缩与分块传输
+### [x] F4.7 `InstallSnapshot` 日志压缩与分块传输
 
 - **目标**：限制 Raft 日志无限增长，并让大幅落后的节点通过快照快速追平。
 - **必写逻辑**：
@@ -323,6 +323,7 @@ sudo apt install -y \
   - 当 Leader 发现某 Follower 的 `next_index <= snapshot_last_index_` 时，改为发送 `InstallSnapshotRequest`（按 1 MB 分块，带 `offset` 和 `done` 标记）。
   - Follower 收齐全部数据块后调用 `StateMachine::LoadSnapshot` 并重置 `last_applied` 与 `commit_index`。
 - **测试验收**：关闭 1 个 Follower，向集群写入足够触发 2 次快照的日志，再重新拉起该 Follower，验证其通过快照追平并正确包含最新数据。
+- **实现补充**：完成目录快照、确定性 bundle、CRC 与路径校验、RaftLog 快照边界重置、阈值触发压缩、分块发送和 offset 回包关联、Follower 完整接收后 LoadSnapshot，以及 `INSTALLING` 崩溃恢复事务。新增 10 个快照相关测试，Debug、ASan/UBSan、TSan 均 45/45 通过，两套快照测试 TSan 连续 10 轮通过。
 
 ### [ ] F4.8 单步成员变更（Single-Server Change）
 

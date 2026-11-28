@@ -100,5 +100,17 @@
   成功。
 - Leader 降级时 pending ReadIndex 返回 NotLeader；超时和 Actor 停止时返回
   Timeout。每个回调执行前先移除 pending 项，保证最多完成一次。
-- Snapshot 与成员变更分别留给 F4.7、F4.8。
+- Apply 距上次快照达到 `snapshot_threshold_entries` 时，StateMachine 将状态写入
+  空目录；RaftNode 打包并校验 `snapshot.bundle`、原子发布快照目录，成功后才通过
+  `CompactPrefix` 删除日志前缀。
+- 快照 bundle 使用固定 magic、版本、文件数量、相对路径、长度和逐文件 CRC32；
+  打包与解包拒绝绝对路径、`..`、重复路径、符号链接和非普通文件。
+- Leader 的 `next_index` 落入已压缩范围时，从 bundle 当前 offset 按
+  `snapshot_chunk_size_bytes` 分块发送 InstallSnapshot。回包关联请求序号、
+  快照 index/term、offset、大小和 done，迟到回包不能推进进度。
+- Follower 只接受连续 offset；完整接收后先解包到临时目录，再持久化 `INSTALLING`
+  事务，依次执行 `LoadSnapshot`、`ResetToSnapshot` 和 commit/apply 镜像更新。
+- 启动时若发现 `INSTALLING`，会重复幂等加载快照并重置 RaftLog；半成品 incoming
+  数据和未关联完整目录会被清理。
+- F4.8 单步成员变更尚未实现。
 

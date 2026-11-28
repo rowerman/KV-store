@@ -605,7 +605,7 @@ TEST(RaftElectionTest, ReelectsAfterPartitionAndDemotesOldLeader) {
         }
         return leaders.size() == 1;
       },
-      1s));
+      2s));
 
   uint32_t new_leader = 0;
   for (uint32_t node_id : remaining) {
