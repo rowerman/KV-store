@@ -304,7 +304,7 @@ sudo apt install -y \
 - **测试验收**：在 `SimTransport` 下模拟连续提交 500 条日志、中途反复制造网络分区与 10% 随机丢包，验证最终所有恢复节点的已提交日志逐条 100% 相同。
 - **实现补充**：完成 No-Op、per-peer next/match、每批 64 条复制、请求序号防迟到覆盖、conflict term/index 快速回退、当前 term 多数派提交、Actor 线程顺序 Apply 和 Propose 生命周期；事件积压期间仍会触发 Tick 与独立心跳。新增 4 个复制测试，Debug、ASan/UBSan、TSan 均通过。
 
-### [ ] F4.6 `ReadIndex` 线性一致读
+### [x] F4.6 `ReadIndex` 线性一致读
 
 - **目标**：在不写 Raft 日志的前提下，保证客户端读请求永远不会读到过期脏数据。
 - **核心数据结构**：`struct PendingRead { uint64_t read_ctx_id; uint64_t read_index; std::unordered_set<uint32_t> acks; ReadCallback cb; };`
@@ -313,6 +313,7 @@ sudo apt install -y \
   2. 生成 `read_ctx_id`，广播一轮附带 `read_ctx_id` 的心跳。
   3. 收到多数派带相同 `read_ctx_id` 的响应后，确认自己仍是合法 Leader；一旦 `last_applied >= read_index`，立即触发 `cb(Status::OK())` 通知上层直读本地存储。
 - **测试验收**：把旧 Leader 隔离在少数派分区，向旧 Leader 发起 `ReadIndex`，验证其永远不会返回成功（最终超时拒绝），杜绝脑裂脏读。
+- **实现补充**：完成当前 term 提交门槛、独立 `read_ctx_id` 确认心跳、成功后回填上下文、多数派去重确认、Apply 进度等待、降级/超时/Actor 停止清理；ReadIndex 心跳不占用复制序号。新增 9 个 ReadIndex 测试，Debug、ASan/UBSan、TSan 均通过，TSan 连续 10 轮通过。
 
 ### [ ] F4.7 `InstallSnapshot` 日志压缩与分块传输
 

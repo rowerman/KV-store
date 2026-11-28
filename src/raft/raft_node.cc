@@ -140,6 +140,17 @@ struct RaftNode::Impl {
   Status AdvanceLeaderCommit();
   void ResetReplicationProgress();
   void FailPendingProposals(const Status& status);
+  Status HandleReadIndex(const ReadIndexEvent& event);
+  Status StartPendingReads();
+  Status SendReadIndexHeartbeat(
+      uint64_t read_ctx_id, uint64_t read_index);
+  void HandleReadIndexResponse(
+      uint32_t peer_id,
+      const proto::AppendEntriesResponse& response);
+  void TryCompletePendingReads();
+  void ExpirePendingReads(Clock::time_point now);
+  void FailPendingReads(const Status& status);
+  Status HasCommittedEntryInCurrentTerm(bool* committed) const;
   Status ValidateAppendEntries(
       const proto::AppendEntriesRequest& request) const;
   Status BuildConflictResponse(
@@ -247,9 +258,20 @@ struct RaftNode::Impl {
     bool inflight = false;
   };
 
+  struct PendingRead {
+    uint64_t read_id = 0;
+    uint64_t read_index = 0;
+    Clock::time_point deadline{};
+    std::unordered_set<uint32_t> acks;
+    ReadIndexCallback done;
+    bool started = false;
+  };
+
   std::unordered_map<uint32_t, PeerReplicationState> replication_;
   std::map<uint64_t, ProposeCallback> pending_proposals_;
+  std::map<uint64_t, PendingRead> pending_reads_;
   uint64_t next_append_sequence_ = 1;
+  uint64_t next_read_ctx_id_ = 1;
 };
 
 void RaftNode::Impl::InstallHandlers() {
@@ -449,6 +471,197 @@ void RaftNode::Impl::FailPendingProposals(const Status& status) {
   }
 }
 
+Status RaftNode::Impl::HasCommittedEntryInCurrentTerm(
+    bool* committed) const {
+  if (committed == nullptr) {
+    return Status::InvalidArgument(
+        "raft read index state output is null");
+  }
+  uint64_t committed_term = 0;
+  Status status = log->TermAt(commit_index, &committed_term);
+  if (!status.ok()) {
+    *committed = false;
+    return status;
+  }
+  *committed = committed_term == current_term;
+  return Status::OK();
+}
+
+Status RaftNode::Impl::HandleReadIndex(
+    const ReadIndexEvent& event) {
+  if (role != Role::kLeader) {
+    if (event.done != nullptr) {
+      event.done(Status::NotLeader("raft node is not leader"));
+    }
+    return Status::OK();
+  }
+  if (next_read_ctx_id_ == std::numeric_limits<uint64_t>::max()) {
+    const Status status =
+        Status::Corruption("raft read context is exhausted");
+    if (event.done != nullptr) {
+      event.done(status);
+    }
+    return status;
+  }
+
+  const uint64_t read_ctx_id = next_read_ctx_id_++;
+  PendingRead pending;
+  pending.read_id = event.read_id;
+  pending.deadline =
+      Clock::now() +
+      std::chrono::milliseconds(options.read_index_timeout_ms);
+  pending.acks.insert(options.node_id);
+  pending.done = event.done;
+  pending_reads_.emplace(read_ctx_id, std::move(pending));
+
+  Status status = StartPendingReads();
+  if (!status.ok()) {
+    return status;
+  }
+  TryCompletePendingReads();
+  return Status::OK();
+}
+
+Status RaftNode::Impl::StartPendingReads() {
+  if (role != Role::kLeader) {
+    return Status::OK();
+  }
+  bool committed = false;
+  Status status = HasCommittedEntryInCurrentTerm(&committed);
+  if (!status.ok() || !committed) {
+    return status;
+  }
+
+  std::vector<std::pair<uint64_t, uint64_t>> contexts;
+  for (auto& entry : pending_reads_) {
+    PendingRead& pending = entry.second;
+    if (pending.started) {
+      continue;
+    }
+    pending.read_index = commit_index;
+    pending.started = true;
+    contexts.emplace_back(entry.first, pending.read_index);
+  }
+  for (const auto& context : contexts) {
+    status =
+        SendReadIndexHeartbeat(context.first, context.second);
+    if (!status.ok()) {
+      return status;
+    }
+  }
+  return Status::OK();
+}
+
+Status RaftNode::Impl::SendReadIndexHeartbeat(
+    uint64_t read_ctx_id, uint64_t read_index) {
+  if (role != Role::kLeader) {
+    return Status::OK();
+  }
+  uint64_t read_term = 0;
+  Status status = log->TermAt(read_index, &read_term);
+  if (!status.ok()) {
+    return status;
+  }
+
+  proto::AppendEntriesRequest request;
+  request.set_term(current_term);
+  request.set_leader_id(options.node_id);
+  request.set_prev_log_index(read_index);
+  request.set_prev_log_term(read_term);
+  request.set_leader_commit(commit_index);
+  request.set_read_ctx_id(read_ctx_id);
+
+  const uint64_t prev_log_index = request.prev_log_index();
+  const std::weak_ptr<ActorEventSink> weak_sink = event_sink;
+  for (uint32_t peer_id : options.peers) {
+    transport->SendAppendEntries(
+        peer_id, request,
+        [weak_sink, peer_id, prev_log_index](
+            Status response_status,
+            proto::AppendEntriesResponse response) {
+          if (const auto sink = weak_sink.lock()) {
+            sink->Post(AppendEntriesResponseEvent{
+                peer_id, 0, prev_log_index, 0,
+                std::move(response_status), std::move(response)});
+          }
+        });
+  }
+  return Status::OK();
+}
+
+void RaftNode::Impl::HandleReadIndexResponse(
+    uint32_t peer_id,
+    const proto::AppendEntriesResponse& response) {
+  if (role != Role::kLeader ||
+      !IsConfiguredPeer(peer_id) ||
+      response.term() != current_term ||
+      !response.success() ||
+      response.read_ctx_id() == 0) {
+    return;
+  }
+  const auto pending = pending_reads_.find(response.read_ctx_id());
+  if (pending == pending_reads_.end() ||
+      !pending->second.started) {
+    return;
+  }
+  pending->second.acks.insert(peer_id);
+  TryCompletePendingReads();
+}
+
+void RaftNode::Impl::TryCompletePendingReads() {
+  if (role != Role::kLeader) {
+    return;
+  }
+  std::vector<ReadIndexCallback> completed;
+  for (auto iterator = pending_reads_.begin();
+       iterator != pending_reads_.end();) {
+    PendingRead& pending = iterator->second;
+    if (!pending.started ||
+        last_applied < pending.read_index ||
+        !HasMajority(pending.acks)) {
+      ++iterator;
+      continue;
+    }
+    completed.push_back(std::move(pending.done));
+    iterator = pending_reads_.erase(iterator);
+  }
+  for (ReadIndexCallback& done : completed) {
+    if (done != nullptr) {
+      done(Status::OK());
+    }
+  }
+}
+
+void RaftNode::Impl::ExpirePendingReads(Clock::time_point now) {
+  std::vector<ReadIndexCallback> expired;
+  for (auto iterator = pending_reads_.begin();
+       iterator != pending_reads_.end();) {
+    if (now < iterator->second.deadline) {
+      ++iterator;
+      continue;
+    }
+    expired.push_back(std::move(iterator->second.done));
+    iterator = pending_reads_.erase(iterator);
+  }
+  const Status status = Status::Timeout("raft read index timed out");
+  for (ReadIndexCallback& done : expired) {
+    if (done != nullptr) {
+      done(status);
+    }
+  }
+}
+
+void RaftNode::Impl::FailPendingReads(const Status& status) {
+  std::map<uint64_t, PendingRead> pending =
+      std::move(pending_reads_);
+  pending_reads_.clear();
+  for (auto& entry : pending) {
+    if (entry.second.done != nullptr) {
+      entry.second.done(status);
+    }
+  }
+}
+
 Status RaftNode::Impl::ApplyCommitted() {
   if (last_applied > commit_index) {
     return Status::Corruption(
@@ -470,6 +683,7 @@ Status RaftNode::Impl::ApplyCommitted() {
     last_applied = index;
     status_last_applied.store(
         last_applied, std::memory_order_relaxed);
+    TryCompletePendingReads();
 
     const auto pending = pending_proposals_.find(index);
     if (pending != pending_proposals_.end()) {
@@ -493,7 +707,11 @@ Status RaftNode::Impl::AdvanceCommitIndex(uint64_t candidate_index) {
   }
   commit_index = candidate_index;
   status_commit.store(commit_index, std::memory_order_relaxed);
-  return ApplyCommitted();
+  Status status = ApplyCommitted();
+  if (!status.ok()) {
+    return status;
+  }
+  return StartPendingReads();
 }
 
 Status RaftNode::Impl::AdvanceLeaderCommit() {
@@ -733,6 +951,7 @@ void RaftNode::Impl::ClearElectionVotes() {
 }
 
 Status RaftNode::Impl::OnTick(Clock::time_point now) {
+  ExpirePendingReads(now);
   if (role == Role::kLeader) {
     if (!HeartbeatDeadlineReached(now)) {
       return Status::OK();
@@ -752,6 +971,8 @@ Status RaftNode::Impl::StartPreVote(Clock::time_point now) {
   }
   FailPendingProposals(
       Status::NotLeader("raft leader stepped down"));
+  FailPendingReads(
+      Status::NotLeader("raft leader stepped down"));
   role = Role::kPreCandidate;
   leader_id = 0;
   ClearElectionVotes();
@@ -769,6 +990,8 @@ Status RaftNode::Impl::BecomeCandidate(Clock::time_point now) {
     return Status::Corruption("raft term is exhausted");
   }
   FailPendingProposals(
+      Status::NotLeader("raft leader stepped down"));
+  FailPendingReads(
       Status::NotLeader("raft leader stepped down"));
   Status status =
       PersistHardState(current_term + 1, options.node_id);
@@ -824,6 +1047,8 @@ Status RaftNode::Impl::ObserveHigherTerm(
     FailPendingProposals(
         Status::NotLeader("raft leader stepped down"));
   }
+  FailPendingReads(
+      Status::NotLeader("raft leader stepped down"));
   ResetElectionDeadline(now);
   PublishStatus();
   return Status::OK();
@@ -1072,6 +1297,9 @@ Status RaftNode::Impl::OnAppendEntriesRequest(
   response.set_success(false);
   const auto complete = [&](Status status, bool success) {
     response.set_success(success);
+    if (success) {
+      response.set_read_ctx_id(event.request.read_ctx_id());
+    }
     if (event.done != nullptr) {
       event.done(std::move(status), response);
     }
@@ -1242,6 +1470,9 @@ Status RaftNode::Impl::OnAppendEntriesResponse(
       event.response.term() > current_term) {
     return ObserveHigherTerm(
         event.response.term(), Clock::now());
+  }
+  if (event.status.ok()) {
+    HandleReadIndexResponse(event.peer_id, event.response);
   }
   const auto replication = replication_.find(event.peer_id);
   if (replication == replication_.end() ||
@@ -1451,12 +1682,7 @@ Status RaftNode::Impl::Step(const RaftEvent& event) {
     return HandlePropose(*proposal);
   }
   if (const auto* read = std::get_if<ReadIndexEvent>(&event)) {
-    if (read->done != nullptr) {
-      read->done(Status::NotLeader(
-          "raft node has not elected a leader"));
-    }
-    PublishStatus();
-    return Status::OK();
+    return HandleReadIndex(*read);
   }
   if (std::holds_alternative<StopEvent>(event)) {
     return Status::OK();
@@ -1541,6 +1767,8 @@ void RaftNode::Impl::Run() {
 
   FailPendingProposals(
       Status::NotLeader("raft actor stopped"));
+  FailPendingReads(
+      Status::Timeout("raft actor stopped"));
   event_sink->Close();
   {
     std::lock_guard<std::mutex> lock(lifecycle_mutex);
@@ -1597,6 +1825,11 @@ Status RaftNode::Create(
       options.election_timeout_max_ms > kMaxTimerIntervalMs) {
     return Status::InvalidArgument(
         "raft election timeout range is invalid");
+  }
+  if (options.read_index_timeout_ms == 0 ||
+      options.read_index_timeout_ms > kMaxTimerIntervalMs) {
+    return Status::InvalidArgument(
+        "raft read index timeout is invalid");
   }
 
   std::unordered_set<uint32_t> peers;

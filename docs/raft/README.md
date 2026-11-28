@@ -88,6 +88,17 @@
   返回 NotLeader。
 - 任何更高 term 的请求或响应都会使 PreCandidate、Candidate 或 Leader 降级为
   Follower。
-- ReadIndex 在 F4.6 实现前仍返回 NotLeader；Snapshot 与成员变更分别留给 F4.7、
-  F4.8。
+- Leader 处理 ReadIndex 前必须先提交当前 term 的日志；未满足时请求进入 pending，
+  直到当前 term 日志提交或 `read_index_timeout_ms` 到期。
+- ReadIndex 记录开始确认时的 `commit_index`，为每个请求分配独立的
+  `read_ctx_id`，并发送不携带日志的确认心跳。确认心跳不占用复制请求序号，也不
+  修改 `next_index/match_index`。
+- Follower 仅在任期、Leader、日志边界和本地提交推进全部成功后回填
+  `read_ctx_id`；失败响应不能作为读确认。
+- 只有来自配置 peer、传输成功、`success=true`、任期一致且 `read_ctx_id` 匹配的
+  响应才计入多数派。多数派确认后仍须等待 `last_applied >= read_index` 才回调
+  成功。
+- Leader 降级时 pending ReadIndex 返回 NotLeader；超时和 Actor 停止时返回
+  Timeout。每个回调执行前先移除 pending 项，保证最多完成一次。
+- Snapshot 与成员变更分别留给 F4.7、F4.8。
 

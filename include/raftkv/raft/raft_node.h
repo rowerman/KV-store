@@ -30,6 +30,8 @@ struct RaftNodeOptions {
   uint64_t heartbeat_interval_ms = 50;
   uint64_t election_timeout_min_ms = 150;
   uint64_t election_timeout_max_ms = 300;
+  // ReadIndex 从入队到完成的最长等待时间。
+  uint64_t read_index_timeout_ms = 1000;
   // 0 表示使用运行时随机源；测试使用非 0 值获得可重复结果。
   uint64_t random_seed = 0;
 };
@@ -97,9 +99,12 @@ struct ProposeEvent {
   ProposeCallback done;
 };
 
+using ReadIndexCallback = std::function<void(Status)>;
+
 struct ReadIndexEvent {
+  // 上层请求标识，不参与 Raft 协议判断。
   uint64_t read_id = 0;
-  std::function<void(Status)> done;
+  ReadIndexCallback done;
 };
 
 struct StopEvent {};

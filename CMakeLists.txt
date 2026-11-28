@@ -309,6 +309,15 @@ target_link_libraries(raft_replication_test PRIVATE
   GTest::gtest_main
 )
 
+add_executable(raft_read_index_test tests/raft_read_index_test.cc)
+target_include_directories(raft_read_index_test PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/tests
+)
+target_link_libraries(raft_read_index_test PRIVATE
+  raftkv_raft
+  GTest::gtest_main
+)
+
 if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET smoke_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
@@ -385,6 +394,9 @@ if(RAFTKV_TSAN_TEST_LAUNCHER)
   set_property(TARGET raft_replication_test PROPERTY CROSSCOMPILING_EMULATOR
     "${RAFTKV_TSAN_TEST_LAUNCHER}"
   )
+  set_property(TARGET raft_read_index_test PROPERTY CROSSCOMPILING_EMULATOR
+    "${RAFTKV_TSAN_TEST_LAUNCHER}"
+  )
 endif()
 
 include(GoogleTest)
@@ -413,3 +425,4 @@ gtest_discover_tests(raft_transport_test)
 gtest_discover_tests(raft_node_test)
 gtest_discover_tests(raft_election_test)
 gtest_discover_tests(raft_replication_test)
+gtest_discover_tests(raft_read_index_test)
