@@ -37,10 +37,36 @@ Leader 路由提示、幂等去重及节点生命周期管理。
 
 ## 构建
 
-- `raftkv_server` 当前包含 `KVStateMachine` 和 `SessionTable`，公开链接
-  `raftkv_raft`、`raftkv_storage` 与 `raftkv_proto`。
+- `raftkv_server` 当前包含 `KVStateMachine`、`SessionTable` 和
+  `RealRaftTransport`，公开链接 `raftkv_raft`、`raftkv_rpc`、`raftkv_storage`
+  与 `raftkv_proto`。
 - 修改 `KvCommand` 字段或 SessionTable 磁盘格式时，必须同时升级格式版本并验证旧
   快照拒绝或迁移行为。
 - 修改状态机快照目录布局时，必须同步检查 Raft snapshot bundle、重复安装和本地
   崩溃恢复路径。
+
+## RealRaftTransport
+
+- 真实传输为每个 Peer 维护一个独立 `RpcClient` 长连接，Peer 之间互不共享在途
+  请求和断线状态。
+- 内部 Raft RPC 固定为 RequestVote 101、AppendEntries 102、InstallSnapshot 103。
+- Peer 地址当前只支持数字 IPv4 和显式非 0 端口；Create 会拒绝零本地 ID、零超时、
+  重复 ID、自引用 Peer 和非法地址。
+- Create 只建立配置与 RpcClient，不发起连接；RegisterRpcMethods 必须在 Start 前
+  调用，同一 Transport 只允许成功注册一次。
+- Start 异步连接全部 Peer。连接建立前的请求返回 Timeout，由 Raft 按既有协议重试。
+- Stop 幂等断开全部 Peer，并让该连接上的挂起调用通过 Timeout 完成。
+- 出站请求中的 `candidate_id/leader_id` 是本地发送节点，必须等于配置的
+  `local_node_id`；目标 Peer 只由 `Send*` 的 `peer_id` 参数选择。
+- 入站 RPC 从 `candidate_id/leader_id` 提取来源节点，再转交 RaftTransport Handler。
+  Handler 只向 Raft Actor 投递事件，网络线程不直接修改 Raft 状态。
+- Handler 在锁内复制、锁外执行，支持 RaftNode 启动阶段安装和替换。
+- RpcServer 注册的处理器捕获 Transport Impl 的弱引用。Transport 销毁后收到的请求
+  返回 Timeout，不会访问悬空对象。
+- 响应必须为对应方法 ID 的 `kResponse` 帧并能解析成目标 Protobuf；否则返回
+  Corruption，不能把错误帧当作默认成功响应。
+- 未配置 Peer 返回 NotFound；发送方 ID 错误返回 InvalidArgument；RPC 连接未建立、
+  断开或超时返回 Timeout。
+- EventLoop 必须在 RpcClient 完成断开前存活；RpcServer 应在 Transport 销毁前停止，
+  避免继续分发新的内部 Raft 请求。
 

@@ -357,11 +357,16 @@ sudo apt install -y \
   LoadSnapshot 通过硬链接临时副本恢复 LSM，使源快照可重复加载。新增 10 个用例，
   Debug、ASan/UBSan、TSan 均 10/10 通过。网络响应关联留给 F5.3。
 
-### [ ] F5.2 真实网络传输实现 `RealRaftTransport`
+### [x] F5.2 真实网络传输实现 `RealRaftTransport`
 
 - **目标**：用 Phase 2 的 `RpcClient` 实现 Phase 4 定义的 `RaftTransport` 接口，替换掉测试用的 `SimTransport`。
 - **文件位置**：`include/raftkv/server/real_raft_transport.h`、`src/server/real_raft_transport.cc`
 - **核心逻辑**：为每个 Peer 节点维护一个长连接 `RpcClient`，将 `SendRequestVote` / `SendAppendEntries` / `SendInstallSnapshot` 映射为异步 RPC 调用，并在回调里把响应重新封装成 `RaftEvent` 投递回 `RaftNode`。
+- **实现补充**：完成数字 IPv4 Peer 配置校验、每 Peer 独立 RpcClient、固定方法 ID
+  101/102/103、三类强类型 RPC 往返和入站 Handler 桥接。出站发送方 ID 严格校验
+  本地节点，入站从请求中的 candidate/leader ID 提取来源。RpcServer Handler 使用
+  Impl 弱引用，Transport 销毁后不会悬空；Stop 可完成挂起调用。新增 6 个真实回环
+  TCP 用例，Debug、ASan/UBSan、TSan 均 6/6 通过，TSan 每项重复 10 轮通过。
 
 ### [ ] F5.3 `KVServer` 与服务端主程序 `raftkv_server`
 
